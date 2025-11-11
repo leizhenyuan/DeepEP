@@ -55,6 +55,7 @@ class Buffer:
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
+            先理解为一个NVL72的特殊的跨节点连接方式吧
             allow_mnnvl: whether to allow MNNVL
             use_fabric: whether to use fabric API for memory buffers.
             enable_shrink: whether to enable shrink mode. The enable mode allocates a mask buffer to support masking ranks dynamically.
@@ -88,6 +89,7 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+        # shrink 让某些节点不参与专家计算
         self.enable_shrink = enable_shrink
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
@@ -98,6 +100,7 @@ class Buffer:
 
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
+        # 获取到所有进程的IPC handles
         ipc_handles = all_gather_object(local_ipc_handle)
 
         # Synchronize NVSHMEM unique IDs
@@ -107,6 +110,7 @@ class Buffer:
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
             os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+            # rdma 的qp 数量，一个local expert 一个qp
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
@@ -290,6 +294,7 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
+    # 发送者视角
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
                             previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                             allocate_on_comm_stream: bool = False) -> \
