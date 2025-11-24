@@ -2,9 +2,11 @@ import os
 import subprocess
 import setuptools
 import importlib
+import sys
 
 from pathlib import Path
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from setuptools import Extension
 
 
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
@@ -106,6 +108,58 @@ if __name__ == '__main__':
     print(f' > NVSHMEM path: {nvshmem_dir}')
     print()
 
+    # Check backend selection
+    use_xpu = int(os.getenv('USE_XPU', 0))
+    use_cuda = int(os.getenv('USE_CUDA', 1))  # Default to 1 (enabled) for backward compatibility
+    ext_modules = []
+
+    # CUDA path: use CUDAExtension
+    if use_cuda:
+        print('CUDA build enabled')
+        ext_modules.append(
+            CUDAExtension(name='deep_ep_cpp',
+                          include_dirs=include_dirs,
+                          library_dirs=library_dirs,
+                          sources=sources,
+                          extra_compile_args=extra_compile_args,
+                          extra_link_args=extra_link_args)
+        )
+        print()
+
+    # XPU path: use Extension with SYCL compiler
+    if use_xpu:
+        print('XPU build enabled')
+        sycl_compiler = os.getenv('SYCL_CXX', 'icpx')
+        
+        # Check if SYCL compiler exists
+        try:
+            subprocess.run([sycl_compiler, '--version'], check=True, capture_output=True)
+            print(f' > SYCL compiler: {sycl_compiler}')
+            
+            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU']
+            sycl_link_args = ['-fsycl']
+            
+            # Add Intel GPU specific optimization flags
+            # Both compile and link need the same target specification
+            sycl_compile_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
+            sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
+            
+            sycl_extension = Extension(
+                name='deep_ep_sycl',
+                sources=['csrc/sycl_hello.cpp'],
+                extra_compile_args=sycl_compile_args,
+                extra_link_args=sycl_link_args,
+                language='c++'
+            )
+            
+            # Override compiler for this extension
+            os.environ['CXX'] = sycl_compiler
+            ext_modules.append(sycl_extension)
+            print(' > XPU extension added: deep_ep_sycl')
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(f'Warning: SYCL compiler {sycl_compiler} not found, skipping XPU extension')
+        print()
+
     # noinspection PyBroadException
     try:
         cmd = ['git', 'rev-parse', '--short', 'HEAD']
@@ -116,12 +170,5 @@ if __name__ == '__main__':
     setuptools.setup(name='deep_ep',
                      version='1.2.1' + revision,
                      packages=setuptools.find_packages(include=['deep_ep']),
-                     ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
-                                       include_dirs=include_dirs,
-                                       library_dirs=library_dirs,
-                                       sources=sources,
-                                       extra_compile_args=extra_compile_args,
-                                       extra_link_args=extra_link_args)
-                     ],
+                     ext_modules=ext_modules,
                      cmdclass={'build_ext': BuildExtension})
