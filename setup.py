@@ -136,7 +136,7 @@ if __name__ == '__main__':
             subprocess.run([sycl_compiler, '--version'], check=True, capture_output=True)
             print(f' > SYCL compiler: {sycl_compiler}')
             
-            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU']
+            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU', '-DNUM_MAX_NVL_PEERS=8']
             sycl_link_args = ['-fsycl']
             
             # Add Intel GPU specific optimization flags
@@ -144,9 +144,17 @@ if __name__ == '__main__':
             sycl_compile_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
             sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
             
+            # XPU sources: deep_ep.cpp and SYCL implementations
+            xpu_sources = ['csrc/deep_ep.cpp', 'csrc/sycl/layout.cpp']
+            
+            # Add common compile flags (without CUDA-specific flags)
+            xpu_cxx_flags = [flag for flag in cxx_flags if 'DISABLE_NVSHMEM' in flag or 'deprecated' in flag or 'unused' in flag or 'sign-compare' in flag or 'reorder' in flag or 'attributes' in flag]
+            sycl_compile_args.extend(xpu_cxx_flags)
+            
             sycl_extension = Extension(
-                name='deep_ep_sycl',
-                sources=['csrc/sycl_hello.cpp'],
+                name='deep_ep_cpp',
+                sources=xpu_sources,
+                include_dirs=include_dirs,
                 extra_compile_args=sycl_compile_args,
                 extra_link_args=sycl_link_args,
                 language='c++'
@@ -155,7 +163,8 @@ if __name__ == '__main__':
             # Override compiler for this extension
             os.environ['CXX'] = sycl_compiler
             ext_modules.append(sycl_extension)
-            print(' > XPU extension added: deep_ep_sycl')
+            print(f' > XPU sources: {xpu_sources}')
+            print(' > XPU extension added: deep_ep_cpp')
         except (subprocess.CalledProcessError, FileNotFoundError):
             print(f'Warning: SYCL compiler {sycl_compiler} not found, skipping XPU extension')
         print()
