@@ -18,6 +18,7 @@
 #include <sycl/sycl.hpp>
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
+#include "sycl/config.hpp"
 #endif
 
 namespace shared_memory {
@@ -2057,7 +2058,13 @@ void Buffer::low_latency_clean_mask_buffer() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepEP: an efficient expert-parallel communication library";
-#ifdef USE_CUDA
+    
+    // EventHandle is available for both CUDA and XPU
+    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
+        .def(pybind11::init<>())
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+
+    // Config is available for both CUDA and XPU
     pybind11::class_<deep_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(),
              py::arg("num_sms") = 20,
@@ -2065,13 +2072,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens") = 256,
              py::arg("num_max_rdma_chunked_send_tokens") = 6,
              py::arg("num_max_rdma_chunked_recv_tokens") = 256)
+        .def_readonly("num_sms", &deep_ep::Config::num_sms)
+        .def_readonly("num_max_nvl_chunked_send_tokens", &deep_ep::Config::num_max_nvl_chunked_send_tokens)
+        .def_readonly("num_max_nvl_chunked_recv_tokens", &deep_ep::Config::num_max_nvl_chunked_recv_tokens)
+        .def_readonly("num_max_rdma_chunked_send_tokens", &deep_ep::Config::num_max_rdma_chunked_send_tokens)
+        .def_readonly("num_max_rdma_chunked_recv_tokens", &deep_ep::Config::num_max_rdma_chunked_recv_tokens)
         .def("get_nvl_buffer_size_hint", &deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
 
-    pybind11::class_<deep_ep::EventHandle>(m, "EventHandle")
-        .def(pybind11::init<>())
-        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+#ifdef USE_CUDA
+    // topk_idx_t type binding - only for CUDA
+    m.attr("topk_idx_t") =
+        py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
@@ -2100,7 +2113,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
-    m.attr("topk_idx_t") =
-        py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
+#endif
+
+#ifdef USE_XPU
+    // XPU-specific bindings
+    // topk_idx_t type will be set from Python side
 #endif
 }

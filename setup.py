@@ -153,12 +153,17 @@ if __name__ == '__main__':
             xpu_cxx_flags = [flag for flag in cxx_flags if 'DISABLE_NVSHMEM' in flag or 'deprecated' in flag or 'unused' in flag or 'sign-compare' in flag or 'reorder' in flag or 'attributes' in flag]
             sycl_compile_args.extend(xpu_cxx_flags)
             
+            import torch
+            torch_lib_path = os.path.join(os.path.dirname(torch.__file__), 'lib')
+            
             sycl_extension = Extension(
                 name='deep_ep_cpp',
                 sources=xpu_sources,
                 include_dirs=include_dirs,
+                library_dirs=[torch_lib_path],
                 extra_compile_args=sycl_compile_args,
                 extra_link_args=sycl_link_args,
+                libraries=['torch_cpu', 'torch', 'torch_python', 'c10'],
                 language='c++'
             )
             

@@ -18,13 +18,15 @@
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
 #include "config.hpp"
-#include "event.hpp"
 #endif
 
 #ifdef USE_XPU
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
 #endif
+
+// Event header is shared between CUDA and XPU
+#include "event.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
