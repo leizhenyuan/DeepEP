@@ -1,18 +1,27 @@
 #include "deep_ep.hpp"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/CUDADataType.h>
-#include <cuda_runtime.h>
 #include <pybind11/functional.h>
 #include <torch/python.h>
 
 #include <chrono>
 #include <memory>
 
+#ifdef USE_CUDA
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDADataType.h>
+#include <cuda_runtime.h>
+#endif
+
+#ifdef USE_XPU
+#include <sycl/sycl.hpp>
+#include <level_zero/ze_api.h>
+#include "sycl/configs.h"
+#endif
 
 namespace shared_memory {
+#ifdef USE_CUDA
 void cu_mem_set_access_all(void* ptr, size_t size) {
     int device_count;
     CUDA_CHECK(cudaGetDeviceCount(&device_count));
@@ -38,6 +47,7 @@ void cu_mem_free(void* ptr) {
     CU_CHECK(cuMemAddressFree((CUdeviceptr)ptr, size));
     CU_CHECK(cuMemRelease(handle));
 }
+#endif
 
 size_t get_size_align_to_granularity(size_t size_raw, size_t granularity) {
     size_t size = (size_raw + granularity - 1) & ~(granularity - 1);
@@ -46,9 +56,19 @@ size_t get_size_align_to_granularity(size_t size_raw, size_t granularity) {
     return size;
 }
 
-SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric) : use_fabric(use_fabric) {}
+SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric) : use_fabric(use_fabric) {
+#ifdef USE_XPU
+    // Initialize Level Zero context and device
+    if (!use_fabric) {
+        sycl::queue q(sycl::gpu_selector_v);
+        ze_context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+        ze_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+    }
+#endif
+}
 
 void SharedMemoryAllocator::malloc(void** ptr, size_t size_raw) {
+#ifdef USE_CUDA
     if (use_fabric) {
         CUdevice device;
         CU_CHECK(cuCtxGetDevice(&device));
@@ -73,17 +93,60 @@ void SharedMemoryAllocator::malloc(void** ptr, size_t size_raw) {
     } else {
         CUDA_CHECK(cudaMalloc(ptr, size_raw));
     }
+#endif
+
+#ifdef USE_XPU
+    if (use_fabric) {
+        // XPU Fabric memory not yet implemented
+        throw std::runtime_error("SharedMemoryAllocator with fabric is not implemented for XPU.");
+    } else {
+        // Use Level Zero to allocate device memory for IPC
+        ze_device_mem_alloc_desc_t alloc_desc = {};
+        alloc_desc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+        alloc_desc.flags = 0;
+        alloc_desc.ordinal = 0;
+        
+        ze_result_t result = zeMemAllocDevice(
+            ze_context,
+            &alloc_desc,
+            size_raw,
+            64,  // alignment
+            ze_device,
+            ptr
+        );
+        
+        if (result != ZE_RESULT_SUCCESS) {
+            throw std::runtime_error("Failed to allocate XPU device memory");
+        }
+    }
+#endif
 }
 
 void SharedMemoryAllocator::free(void* ptr) {
+#ifdef USE_CUDA
     if (use_fabric) {
         cu_mem_free(ptr);
     } else {
         CUDA_CHECK(cudaFree(ptr));
     }
+#endif
+
+#ifdef USE_XPU
+    if (use_fabric) {
+        // XPU Fabric memory not yet implemented
+        throw std::runtime_error("SharedMemoryAllocator with fabric is not implemented for XPU.");
+    } else {
+        // Use Level Zero to free device memory
+        ze_result_t result = zeMemFree(ze_context, ptr);
+        if (result != ZE_RESULT_SUCCESS) {
+            throw std::runtime_error("Failed to free XPU device memory");
+        }
+    }
+#endif
 }
 
 void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
+#ifdef USE_CUDA
     size_t size = 0;
     CU_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr));
 
@@ -97,9 +160,35 @@ void SharedMemoryAllocator::get_mem_handle(MemHandle* mem_handle, void* ptr) {
     } else {
         CUDA_CHECK(cudaIpcGetMemHandle(&mem_handle->inner.cuda_ipc_mem_handle, ptr));
     }
+#endif
+
+#ifdef USE_XPU
+    // Get base address range and size
+    void* base_addr;
+    size_t base_size;
+    ze_result_t result = zeMemGetAddressRange(ze_context, ptr, &base_addr, &base_size);
+    if (result != ZE_RESULT_SUCCESS) {
+        throw std::runtime_error("Failed to get XPU memory address range");
+    }
+
+    mem_handle->size = base_size;
+
+    if (use_fabric) {
+        // XPU Fabric memory not yet implemented
+        throw std::runtime_error("SharedMemoryAllocator with fabric is not implemented for XPU.");
+    } else {
+        // Export Level Zero IPC handle
+        result = zeMemGetIpcHandle(ze_context, base_addr, &mem_handle->inner.ze_ipc_mem_handle);
+        if (result != ZE_RESULT_SUCCESS) {
+            throw std::runtime_error("Failed to get XPU IPC handle");
+        }
+    }
+#endif
+
 }
 
 void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
+#ifdef USE_CUDA
     if (use_fabric) {
         size_t size = mem_handle->size;
 
@@ -112,19 +201,56 @@ void SharedMemoryAllocator::open_mem_handle(void** ptr, MemHandle* mem_handle) {
     } else {
         CUDA_CHECK(cudaIpcOpenMemHandle(ptr, mem_handle->inner.cuda_ipc_mem_handle, cudaIpcMemLazyEnablePeerAccess));
     }
+#endif
+
+#ifdef USE_XPU
+    if (use_fabric) {
+        // XPU Fabric memory not yet implemented
+        throw std::runtime_error("SharedMemoryAllocator with fabric is not implemented for XPU.");
+    } else {
+        // Import Level Zero IPC handle
+        ze_result_t result = zeMemOpenIpcHandle(
+            ze_context,
+            ze_device,
+            mem_handle->inner.ze_ipc_mem_handle,
+            ZE_IPC_MEMORY_FLAG_BIAS_CACHED,  // Equivalent to cudaIpcMemLazyEnablePeerAccess
+            ptr
+        );
+        
+        if (result != ZE_RESULT_SUCCESS) {
+            throw std::runtime_error("Failed to open XPU IPC handle");
+        }
+    }
+#endif
 }
 
 void SharedMemoryAllocator::close_mem_handle(void* ptr) {
+#ifdef USE_CUDA
     if (use_fabric) {
         cu_mem_free(ptr);
     } else {
         CUDA_CHECK(cudaIpcCloseMemHandle(ptr));
     }
+#endif
+
+#ifdef USE_XPU
+    if (use_fabric) {
+        // XPU Fabric memory not yet implemented
+        throw std::runtime_error("SharedMemoryAllocator with fabric is not implemented for XPU.");
+    } else {
+        // Close Level Zero IPC handle
+        ze_result_t result = zeMemCloseIpcHandle(ze_context, ptr);
+        if (result != ZE_RESULT_SUCCESS) {
+            throw std::runtime_error("Failed to close XPU IPC handle");
+        }
+    }
+#endif
 }
 }  // namespace shared_memory
 
 namespace deep_ep {
-
+// todo: remove cuda stream related currently.
+#ifdef USE_CUDA
 Buffer::Buffer(int rank,
                int num_ranks,
                int64_t num_nvl_bytes,
@@ -140,7 +266,7 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-      comm_stream(at::cuda::getStreamFromPool(true)),
+    //   comm_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -161,7 +287,7 @@ Buffer::Buffer(int rank,
         EP_HOST_ASSERT(num_ranks > NUM_MAX_NVL_PEERS or low_latency_mode);
 
     // Get ranks
-    CUDA_CHECK(cudaGetDevice(&device_id));
+    // CUDA_CHECK(cudaGetDevice(&device_id));
     rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS), num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
 #ifdef DISABLE_NVSHMEM
@@ -169,18 +295,32 @@ Buffer::Buffer(int rank,
 #endif
 
     // Get device info
+#ifdef USE_XPU
+    // Get device info
+    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+    sycl::device current_device = devices[device_id];
+    num_device_sms = current_device.get_info<sycl::info::device::max_compute_units>();
+#endif
+
+#ifdef USE_CUDA
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
     num_device_sms = device_prop.multiProcessorCount;
+#endif
 
     // Number of per-channel bytes cannot be large
     EP_HOST_ASSERT(ceil_div<int64_t>(num_nvl_bytes, num_device_sms / 2) < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(ceil_div<int64_t>(num_rdma_bytes, num_device_sms / 2) < std::numeric_limits<int>::max());
 
+    // intra-node
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
-                                       num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
+                                       num_nvl_bytes + // 数据buffer
+                                       barrier_signal_bytes + // 屏障信号
+                                       buffer_ptr_bytes + // 缓冲区
+                                       barrier_signal_ptr_bytes); // 屏障信号指针数组
+        // 创建ipc handle
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
@@ -190,9 +330,14 @@ Buffer::Buffer(int rank,
             reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
+#ifdef USE_CUDA
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
+#elif defined(USE_XPU)
+        comm_queue.memset(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes).wait();
+#endif
     }
 
+#ifdef USE_CUDA
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
@@ -214,6 +359,29 @@ Buffer::Buffer(int rank,
         CUDA_CHECK(cudaHostGetDevicePointer(&moe_recv_rdma_counter_mapped, const_cast<int*>(moe_recv_rdma_counter), 0));
         *moe_recv_rdma_counter = -1;
     }
+#elif defined(USE_XPU)
+    // Create 32 MiB workspace
+    workspace = sycl::malloc_device(NUM_WORKSPACE_BYTES, comm_queue);
+    comm_queue.memset(workspace, 0, NUM_WORKSPACE_BYTES).wait();
+
+    // MoE counter (use shared memory for host-device access)
+    moe_recv_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int64_t), comm_queue)));
+    moe_recv_counter_mapped = const_cast<int*>(moe_recv_counter);
+    *moe_recv_counter = -1;
+
+    // MoE expert-level counter
+    moe_recv_expert_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int) * NUM_MAX_LOCAL_EXPERTS, comm_queue)));
+    moe_recv_expert_counter_mapped = const_cast<int*>(moe_recv_expert_counter);
+    for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
+        moe_recv_expert_counter[i] = -1;
+
+    // MoE RDMA-level counter
+    if (num_rdma_ranks > 0) {
+        moe_recv_rdma_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int), comm_queue)));
+        moe_recv_rdma_counter_mapped = const_cast<int*>(moe_recv_rdma_counter);
+        *moe_recv_rdma_counter = -1;
+    }
+#endif
 }
 
 Buffer::~Buffer() noexcept(false) {
@@ -323,6 +491,8 @@ void Buffer::destroy() {
     available = false;
 }
 
+// 同步不同node之间的nvl buffer
+// 如果需要的话还会构造nv link
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
@@ -337,6 +507,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
             EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
             if (offset + i != rank) {
+                // 复制远程的 IPC 句柄到本地数组
                 std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
                 shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
@@ -390,6 +561,38 @@ void Buffer::sync(const std::vector<int>& device_ids,
     available = true;
 }
 
+#ifdef USE_XPU
+#include "csrc/sycl/layout.hpp"
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+Buffer::get_dispatch_layout(    
+    const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(topk_idx.dim() == 2);
+    EP_HOST_ASSERT(topk_idx.is_contiguous());
+    EP_HOST_ASSERT(num_experts > 0);
+
+    //todo：event overlapping
+    auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
+    auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kXPU));
+    auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
+    auto num_tokens_per_expert = torch::empty({num_experts}, dtype(torch::kInt32).device(torch::kXPU));
+    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kXPU));
+    if (is_internode_available())
+        num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kXPU));
+    layout::get_dispatch_layout(topk_idx.data_ptr<topk_idx_t>(),
+                                num_tokens_per_rank.data_ptr<int>(),
+                                num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
+                                num_tokens_per_expert.data_ptr<int>(),
+                                is_token_in_rank.data_ptr<bool>(),
+                                num_tokens,
+                                num_topk,
+                                num_ranks,
+                                num_experts,
+                                comm_stream);
+    return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
+}
+#endif
+
+#ifdef USE_CUDA
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(
     const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
@@ -455,6 +658,7 @@ Buffer::get_dispatch_layout(
 
     return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
 }
+#endif
 
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
@@ -591,6 +795,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         intranode::cached_notify_dispatch(
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
     } else {
+        
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
 
@@ -1308,7 +1513,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> Buffer::internode_combine(
-    const torch::Tensor& x,
+    const torch::Tensor& x,         // 本地export计算完之后的 token
     const std::optional<torch::Tensor>& topk_weights,
     const std::optional<torch::Tensor>& bias_0,
     const std::optional<torch::Tensor>& bias_1,
@@ -1664,6 +1869,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
+    // 接收到的数据张量
+    // 接收到的数据缩放张量（如果使用FP8）
+    // 本地每个专家接收到的token数量
+    // 每个接收到的token的原始位置
+    // 
     return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
@@ -1822,6 +2032,7 @@ bool is_sm90_compiled() {
 #endif
 }
 
+#ifndef DISABLE_NVSHMEM
 void Buffer::low_latency_update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < num_ranks);
@@ -1840,12 +2051,13 @@ void Buffer::low_latency_clean_mask_buffer() {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
-
+#endif
+#endif
 }  // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepEP: an efficient expert-parallel communication library";
-
+#ifdef USE_CUDA
     pybind11::class_<deep_ep::Config>(m, "Config")
         .def(pybind11::init<int, int, int, int, int>(),
              py::arg("num_sms") = 20,
@@ -1890,4 +2102,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
     m.attr("topk_idx_t") =
         py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
+#endif
 }

@@ -12,10 +12,19 @@
 #include <tuple>
 #include <vector>
 
-#include "config.hpp"
-#include "event.hpp"
+
+
+#ifdef USE_CUDA
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
+#include "config.hpp"
+#include "event.hpp"
+#endif
+
+#ifdef USE_XPU
+#include <level_zero/ze_api.h>
+#include "sycl/configs.h"
+#endif
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
@@ -24,8 +33,13 @@
 namespace shared_memory {
 
 union MemHandleInner {
+    // 节点内部通信进程句柄
+#ifdef USE_CUDA
     cudaIpcMemHandle_t cuda_ipc_mem_handle;
     CUmemFabricHandle cu_mem_fabric_handle;
+#elif defined(USE_XPU)
+    ze_ipc_mem_handle_t ze_ipc_mem_handle;
+#endif
 };
 
 struct MemHandle {
@@ -46,6 +60,10 @@ public:
 
 private:
     bool use_fabric;
+#ifdef USE_XPU
+    ze_context_handle_t ze_context;
+    ze_device_handle_t ze_device;
+#endif
 };
 }  // namespace shared_memory
 
@@ -81,7 +99,11 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
+#ifdef USE_CUDA
     at::cuda::CUDAStream comm_stream;
+#elif defined(USE_XPU)
+    sycl::queue comm_queue;
+#endif
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -113,6 +135,7 @@ private:
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
+#ifdef USE_CUDA
     Buffer(int rank,
            int num_ranks,
            int64_t num_nvl_bytes,
@@ -123,6 +146,7 @@ public:
            bool use_fabric);
 
     ~Buffer() noexcept(false);
+
 
     bool is_available() const;
 
@@ -295,6 +319,7 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+#endif
 };
 
 }  // namespace deep_ep

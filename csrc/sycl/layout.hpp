@@ -1,5 +1,5 @@
 #pragma once
-
+#include "configs.h"
 #include <sycl/sycl.hpp>
 #include <cstdint>
 

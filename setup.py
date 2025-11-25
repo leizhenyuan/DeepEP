@@ -3,6 +3,7 @@ import subprocess
 import setuptools
 import importlib
 import sys
+import torch
 
 from pathlib import Path
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -97,6 +98,7 @@ if __name__ == '__main__':
     if len(nvcc_dlink) > 0:
         extra_compile_args['nvcc_dlink'] = nvcc_dlink
 
+    include_dirs.extend(torch.utils.cpp_extension.include_paths())
     # Summary
     print('Build summary:')
     print(f' > Sources: {sources}')
@@ -136,7 +138,7 @@ if __name__ == '__main__':
             subprocess.run([sycl_compiler, '--version'], check=True, capture_output=True)
             print(f' > SYCL compiler: {sycl_compiler}')
             
-            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU', '-DNUM_MAX_NVL_PEERS=8']
+            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU']
             sycl_link_args = ['-fsycl']
             
             # Add Intel GPU specific optimization flags
