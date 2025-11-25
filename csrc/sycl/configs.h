@@ -20,7 +20,17 @@
 #define LOW_LATENCY_SEND_PHASE 1
 #define LOW_LATENCY_RECV_PHASE 2
 
+// Assert macros for XPU
+#define EP_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#define EP_HOST_ASSERT(condition) assert(condition)
+
+#include <cassert>
 #include <cstdint>
+
+// Define int4 for SYCL (CUDA has this builtin)
+struct int4 {
+    int x, y, z, w;
+};
 
 namespace deep_ep {
 
@@ -33,6 +43,22 @@ namespace deep_ep {
 typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 #undef INT_BITS_T
 #undef INT_BITS_T2
+
+// Helper functions that exist in CUDA
+template<typename T>
+inline constexpr T ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+template<typename T>
+inline constexpr T align_up(T val, T alignment) {
+    return ceil_div(val, alignment) * alignment;
+}
+
+template<typename T>
+inline constexpr T align_down(T val, T alignment) {
+    return (val / alignment) * alignment;
+}
 
 }  // namespace deep_ep
 

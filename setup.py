@@ -139,7 +139,7 @@ if __name__ == '__main__':
             print(f' > SYCL compiler: {sycl_compiler}')
             
             sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU']
-            sycl_link_args = ['-fsycl']
+            sycl_link_args = ['-fsycl', '-lze_loader']
             
             # Add Intel GPU specific optimization flags
             # Both compile and link need the same target specification
