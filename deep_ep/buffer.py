@@ -64,7 +64,7 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
         """
-        check_nvlink_connections(group)
+        # check_nvlink_connections(group)
 
         # Initialize the CPP runtime
         if group is not None:
@@ -100,7 +100,7 @@ class Buffer:
 
         # Synchronize IPC handles
         local_ipc_handle = self.runtime.get_local_ipc_handle()
-        # 获取到所有进程的IPC handles
+        # 获取到所有进程的IPC handles，注意是不同node上面的
         ipc_handles = all_gather_object(local_ipc_handle)
 
         # Synchronize NVSHMEM unique IDs
@@ -133,6 +133,7 @@ class Buffer:
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
             nvshmem_unique_ids = all_gather_object(root_unique_id)
+            # 统一一个 nvshmem unique id
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
         # Make CPP runtime available
@@ -246,6 +247,11 @@ class Buffer:
         """
 
         # TODO: automatically tune
+        # int num_sms;
+        # int num_max_nvl_chunked_send_tokens;
+        # int num_max_nvl_chunked_recv_tokens;
+        # int num_max_rdma_chunked_send_tokens;
+        # int num_max_rdma_chunked_recv_tokens;
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
             4: Config(Buffer.num_sms, 6, 256, 6, 128),
@@ -326,12 +332,17 @@ class Buffer:
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  handle: Optional[Tuple] = None,
-                 num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
-                 is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
-                 topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None,
-                 expert_alignment: int = 1, num_worst_tokens: int = 0,
+                 num_tokens_per_rank: Optional[torch.Tensor] = None, 
+                 num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+                 is_token_in_rank: Optional[torch.Tensor] = None, 
+                 num_tokens_per_expert: Optional[torch.Tensor] = None,
+                 topk_idx: Optional[torch.Tensor] = None, 
+                 topk_weights: Optional[torch.Tensor] = None,
+                 expert_alignment: int = 1, 
+                 num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
-                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                 previous_event: Optional[EventOverlap] = None, 
+                 async_finish: bool = False,
                  allocate_on_comm_stream: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                   Optional[torch.Tensor], List[int], Tuple, EventOverlap]:

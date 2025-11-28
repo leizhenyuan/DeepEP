@@ -23,6 +23,7 @@
 #ifdef USE_XPU
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
+#include "sycl/config.hpp"
 #endif
 
 // Event header is shared between CUDA and XPU
@@ -104,7 +105,7 @@ private:
 #ifdef USE_CUDA
     at::cuda::CUDAStream comm_stream;
 #elif defined(USE_XPU)
-    sycl::queue comm_queue;
+    sycl::queue comm_stream;
 #endif
 
     // After IPC/NVSHMEM synchronization, this flag will be true
@@ -137,7 +138,6 @@ private:
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
 public:
-#ifdef USE_CUDA
     Buffer(int rank,
            int num_ranks,
            int64_t num_nvl_bytes,
@@ -225,6 +225,14 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+    // Platform-specific methods
+#ifdef USE_CUDA
+    // CUDA-specific methods
+    pybind11::bytearray get_local_nvshmem_unique_id() const;
+    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
+    torch::Stream get_comm_stream() const;
+
+    // NVSHMEM-based internode communication (CUDA only)
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -321,6 +329,15 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+
+#elif defined(USE_XPU)
+    // XPU-specific methods
+    sycl::queue get_comm_queue() const;
+    
+    // Future: XPU internode communication methods when ISHMEM is ready
+    // std::tuple<...> internode_dispatch(...);  // TODO: Implement with ISHMEM
+    // std::tuple<...> internode_combine(...);   // TODO: Implement with ISHMEM
+
 #endif
 };
 

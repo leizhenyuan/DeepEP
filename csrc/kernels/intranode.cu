@@ -8,6 +8,7 @@ namespace deep_ep {
 
 namespace intranode {
 
+// 用来计算dispatch 和combine阶段所需要的metadata
 template <int kNumRanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int* moe_recv_counter_mapped,

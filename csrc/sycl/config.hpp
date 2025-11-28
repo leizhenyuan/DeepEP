@@ -2,6 +2,14 @@
 
 #include "configs.h"
 
+// Include template utilities
+namespace {
+    template <typename T>
+    constexpr T align_up(T value, T alignment) {
+        return (value + alignment - 1) / alignment * alignment;
+    }
+}
+
 namespace deep_ep {
 
 struct Config {

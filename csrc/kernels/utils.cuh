@@ -501,6 +501,7 @@ __forceinline__ __device__ out_dtype_t extract_required_scale_format(float value
     }
 }
 
+// todo: summer behaviour and usage
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
     auto thread_id = static_cast<int>(threadIdx.x);

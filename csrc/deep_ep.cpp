@@ -15,6 +15,7 @@
 #endif
 
 #ifdef USE_XPU
+#include "sycl/api.hpp"
 #include <sycl/sycl.hpp>
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
@@ -251,7 +252,7 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
 
 namespace deep_ep {
 // todo: remove cuda stream related currently.
-#ifdef USE_CUDA
+
 Buffer::Buffer(int rank,
                int num_ranks,
                int64_t num_nvl_bytes,
@@ -267,8 +268,15 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-    //   comm_stream(at::cuda::getStreamFromPool(true)),
+#ifdef USE_CUDA
+      comm_stream(at::cuda::getStreamFromPool(true)),
+#endif
       shared_memory_allocator(use_fabric) {
+#ifdef USE_XPU
+    comm_stream = sycl::queue(sycl::gpu_selector_v,
+                            sycl::property::queue::in_order{});
+#endif
+
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
@@ -334,7 +342,7 @@ Buffer::Buffer(int rank,
 #ifdef USE_CUDA
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
 #elif defined(USE_XPU)
-        comm_queue.memset(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes).wait();
+        comm_stream.memset(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes).wait();
 #endif
     }
 
@@ -362,28 +370,29 @@ Buffer::Buffer(int rank,
     }
 #elif defined(USE_XPU)
     // Create 32 MiB workspace
-    workspace = sycl::malloc_device(NUM_WORKSPACE_BYTES, comm_queue);
-    comm_queue.memset(workspace, 0, NUM_WORKSPACE_BYTES).wait();
+    workspace = sycl::malloc_device(NUM_WORKSPACE_BYTES, comm_stream);
+    comm_stream.memset(workspace, 0, NUM_WORKSPACE_BYTES).wait();
 
     // MoE counter (use shared memory for host-device access)
-    moe_recv_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int64_t), comm_queue)));
+    moe_recv_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int64_t), comm_stream)));
     moe_recv_counter_mapped = const_cast<int*>(moe_recv_counter);
     *moe_recv_counter = -1;
 
     // MoE expert-level counter
-    moe_recv_expert_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int) * NUM_MAX_LOCAL_EXPERTS, comm_queue)));
+    moe_recv_expert_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int) * NUM_MAX_LOCAL_EXPERTS, comm_stream)));
     moe_recv_expert_counter_mapped = const_cast<int*>(moe_recv_expert_counter);
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
         moe_recv_expert_counter[i] = -1;
 
     // MoE RDMA-level counter
     if (num_rdma_ranks > 0) {
-        moe_recv_rdma_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int), comm_queue)));
+        moe_recv_rdma_counter = const_cast<volatile int*>(static_cast<int*>(sycl::malloc_shared(sizeof(int), comm_stream)));
         moe_recv_rdma_counter_mapped = const_cast<int*>(moe_recv_rdma_counter);
         *moe_recv_rdma_counter = -1;
     }
 #endif
 }
+
 
 Buffer::~Buffer() noexcept(false) {
     if (not explicitly_destroy) {
@@ -393,6 +402,7 @@ Buffer::~Buffer() noexcept(false) {
         fflush(stdout);
     }
 }
+
 
 bool Buffer::is_available() const {
     return available;
@@ -423,6 +433,7 @@ pybind11::bytearray Buffer::get_local_ipc_handle() const {
     return {reinterpret_cast<const char*>(&handle), sizeof(handle)};
 }
 
+#ifdef USE_CUDA
 pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get NVSHMEM unique ID");
@@ -432,7 +443,9 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
 }
+#endif // USE_CUDA
 
+#ifdef USE_CUDA  
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
     auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
@@ -440,7 +453,9 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
+#endif // USE_CUDA
 
+#ifdef USE_CUDA
 torch::Stream Buffer::get_comm_stream() const {
     return comm_stream;
 }
@@ -492,8 +507,6 @@ void Buffer::destroy() {
     available = false;
 }
 
-// 同步不同node之间的nvl buffer
-// 如果需要的话还会构造nv link
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
@@ -2081,27 +2094,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_rdma_buffer_size_hint", &deep_ep::Config::get_rdma_buffer_size_hint);
     m.def("get_low_latency_rdma_size_hint", &deep_ep::get_low_latency_rdma_size_hint);
 
-#ifdef USE_CUDA
-    // topk_idx_t type binding - only for CUDA
-    m.attr("topk_idx_t") =
-        py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
-
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
+        // Common methods available on both platforms
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
         .def("get_local_device_id", &deep_ep::Buffer::get_local_device_id)
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
-        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
-        .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
-        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("sync", &deep_ep::Buffer::sync)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
+#ifdef USE_CUDA
+        // CUDA-specific methods
+        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
+        .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
@@ -2110,13 +2121,110 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
-        .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
-
-    m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
+        .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer)
+#elif defined(USE_XPU)
+        // XPU-specific methods
+        .def("get_comm_queue", &deep_ep::Buffer::get_comm_queue)
 #endif
+        ;
 
-#ifdef USE_XPU
+#ifdef USE_CUDA
+    m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
+
+    // topk_idx_t type binding - only for CUDA
+    m.attr("topk_idx_t") =
+        py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
+#elif defined(USE_XPU)
     // XPU-specific bindings
-    // topk_idx_t type will be set from Python side
+    // topk_idx_t type will be set from Python side for XPU
+    // No is_sm90_compiled for XPU
 #endif
 }
+
+#ifdef USE_XPU
+// XPU stub implementations - TODO: implement actual functionality
+
+void deep_ep::Buffer::destroy() {
+    // XPU stub - TODO: implement XPU-specific cleanup
+    destroyed = true;
+    available = false;
+}
+
+void deep_ep::Buffer::sync(const std::vector<int>& device_ids,
+                           const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
+                           const std::optional<pybind11::bytearray>& root_unique_id_opt) {
+    // XPU stub - TODO: implement XPU-specific synchronization
+    available = true;
+}
+
+std::tuple<torch::Tensor,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
+           std::vector<int>,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           std::optional<deep_ep::EventHandle>>
+deep_ep::Buffer::intranode_dispatch(const torch::Tensor& x,
+                                   const std::optional<torch::Tensor>& x_scales,
+                                   const std::optional<torch::Tensor>& topk_idx,
+                                   const std::optional<torch::Tensor>& topk_weights,
+                                   const std::optional<torch::Tensor>& num_tokens_per_rank,
+                                   const torch::Tensor& is_token_in_rank,
+                                   const std::optional<torch::Tensor>& num_tokens_per_expert,
+                                   int cached_num_recv_tokens,
+                                   const std::optional<torch::Tensor>& cached_rank_prefix_matrix,
+                                   const std::optional<torch::Tensor>& cached_channel_prefix_matrix,
+                                   int expert_alignment,
+                                   int num_worst_tokens,
+                                   const deep_ep::Config& config,
+                                   std::optional<deep_ep::EventHandle>& previous_event,
+                                   bool async,
+                                   bool allocate_on_comm_stream) {
+    // XPU stub - TODO: implement XPU intranode dispatch
+    auto dummy_tensor = torch::empty({1}, torch::kInt32);
+    return std::make_tuple(dummy_tensor, std::nullopt, std::nullopt, std::nullopt, 
+                          std::vector<int>(), dummy_tensor, dummy_tensor, 
+                          dummy_tensor, dummy_tensor, dummy_tensor, std::nullopt);
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<deep_ep::EventHandle>>
+deep_ep::Buffer::intranode_combine(const torch::Tensor& x,
+                                  const std::optional<torch::Tensor>& topk_weights,
+                                  const std::optional<torch::Tensor>& bias_0,
+                                  const std::optional<torch::Tensor>& bias_1,
+                                  const torch::Tensor& src_idx,
+                                  const torch::Tensor& rank_prefix_matrix,
+                                  const torch::Tensor& channel_prefix_matrix,
+                                  const torch::Tensor& send_head,
+                                  const deep_ep::Config& config,
+                                  std::optional<deep_ep::EventHandle>& previous_event,
+                                  bool async,
+                                  bool allocate_on_comm_stream) {
+    // XPU stub - TODO: implement XPU intranode combine
+    auto dummy_tensor = torch::empty_like(x);
+    return std::make_tuple(dummy_tensor, std::nullopt, std::nullopt);
+}
+
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<deep_ep::EventHandle>>
+deep_ep::Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, 
+                                     int num_experts, 
+                                     std::optional<deep_ep::EventHandle>& previous_event, 
+                                     bool async, 
+                                     bool allocate_on_comm_stream) {
+    // XPU stub - TODO: implement XPU get_dispatch_layout
+    auto num_tokens = static_cast<int>(topk_idx.size(0));
+    auto dummy_int_tensor = torch::zeros({num_ranks}, torch::kInt32);
+    auto dummy_bool_tensor = torch::zeros({num_tokens, num_ranks}, torch::kBool);
+    return std::make_tuple(dummy_int_tensor, std::nullopt, dummy_int_tensor, dummy_bool_tensor, std::nullopt);
+}
+
+sycl::queue deep_ep::Buffer::get_comm_queue() const {
+    // XPU stub implementation - return the communication stream/queue
+    return comm_stream;
+}
+
+#endif // USE_XPU

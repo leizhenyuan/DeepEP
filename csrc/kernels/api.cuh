@@ -1,11 +1,8 @@
 #pragma once
 
 #include <vector>
-#ifdef USE_CUDA
 #include "configs.cuh"
-#elif defined(USE_XPU)
-#include "sycl/configs.h"
-#endif
+
 namespace deep_ep {
 
 // Intranode runtime

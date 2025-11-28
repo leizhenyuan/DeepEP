@@ -102,7 +102,12 @@ private:
 public:
     int64_t total_bytes;
 
-    __device__ __forceinline__ SymBuffer(void*& gbl_ptr, int num_elems, int num_ranks, int sm_id = 0, int num_sms = 1) {
+    __device__ __forceinline__ SymBuffer(
+        void*& gbl_ptr,     // RDMA buffer的base 地址
+        int num_elems,      // 每个 rank的元素数量
+        int num_ranks,      // rdma rank 数量
+        int sm_id = 0, 
+        int num_sms = 1) {
         num_bytes = num_elems * sizeof(dtype_t);
 
         int64_t per_channel_bytes = num_bytes * num_ranks;
