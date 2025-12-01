@@ -9,6 +9,8 @@ import deep_ep_cpp
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
 
+USE_XPU = os.environ.get('USE_XPU', '0').lower() in ('1', 'true', 'yes')
+
 
 class Buffer:
     """
@@ -105,35 +107,37 @@ class Buffer:
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
-        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode and not USE_XPU:
             # Enable IBGDA
             assert num_qps_per_rank > 0
-            os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-            # rdma 的qp 数量，一个local expert 一个qp
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            # todo 使用环境变量或许更好一些？
+            # os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
+            # os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+            # # rdma 的qp 数量，一个local expert 一个qp
+            # os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
-            # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-            self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
-            os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
+            # # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
+            # self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
+            # os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
 
-            # Reduce gpu memory usage
-            # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-            # NOTES: NVSHMEM initialization requires at least 256 MiB
-            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+            # # Reduce gpu memory usage
+            # # 6 default teams + 1 extra team
+            # os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+            # # Disable NVLink SHArP
+            # os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+            # # NOTES: NVSHMEM initialization requires at least 256 MiB
+            # os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
 
-            if not allow_mnnvl:
-                # Disable multi-node NVLink detection
-                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+            # if not allow_mnnvl:
+            #     # Disable multi-node NVLink detection
+            #     os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
             nvshmem_unique_ids = all_gather_object(root_unique_id)
             # 统一一个 nvshmem unique id
+            # global ? nvl_rank : 0;
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
         # Make CPP runtime available
@@ -389,7 +393,7 @@ class Buffer:
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.runtime.get_num_rdma_ranks() > 1 and not USE_XPU:
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                            previous_event, async_finish, allocate_on_comm_stream)

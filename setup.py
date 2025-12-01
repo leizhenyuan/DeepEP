@@ -147,7 +147,7 @@ if __name__ == '__main__':
             sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
             
             # XPU sources: deep_ep.cpp and SYCL implementations
-            xpu_sources = ['csrc/deep_ep.cpp', 'csrc/sycl/layout.cpp']
+            xpu_sources = ['csrc/deep_ep.cpp', 'csrc/sycl/layout.cpp', 'csrc/sycl/intranode.cpp', 'csrc/sycl/runtime.cpp']
             
             # Add common compile flags (without CUDA-specific flags)
             xpu_cxx_flags = [flag for flag in cxx_flags if 'DISABLE_NVSHMEM' in flag or 'deprecated' in flag or 'unused' in flag or 'sign-compare' in flag or 'reorder' in flag or 'attributes' in flag]

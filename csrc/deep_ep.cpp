@@ -273,6 +273,8 @@ Buffer::Buffer(int rank,
 #endif
       shared_memory_allocator(use_fabric) {
 #ifdef USE_XPU
+    // XPU does not support fabric mode yet
+    EP_HOST_ASSERT(not use_fabric and "XPU does not support fabric mode yet");
     comm_stream = sycl::queue(sycl::gpu_selector_v,
                             sycl::property::queue::in_order{});
 #endif
@@ -445,6 +447,14 @@ pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
 }
 #endif // USE_CUDA
 
+#ifdef USE_XPU
+pybind11::bytearray Buffer::get_local_nvshmem_unique_id() const {
+    EP_HOST_ASSERT(rdma_rank == 0 and "Only RDMA rank 0 can get ISHMEM unique ID");
+    auto unique_id = internode::get_unique_id();
+    return {reinterpret_cast<const char*>(unique_id.data()), unique_id.size()};
+}
+#endif // USE_XPU
+
 #ifdef USE_CUDA  
 torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
     torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
@@ -506,7 +516,7 @@ void Buffer::destroy() {
     destroyed = true;
     available = false;
 }
-
+#ifdef USE_CUDA
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
@@ -521,7 +531,6 @@ void Buffer::sync(const std::vector<int>& device_ids,
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
             EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
             if (offset + i != rank) {
-                // 复制远程的 IPC 句柄到本地数组
                 std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
                 shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
@@ -574,6 +583,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // Ready to use
     available = true;
 }
+#endif
 
 #ifdef USE_XPU
 #include "csrc/sycl/layout.hpp"
@@ -2108,9 +2118,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
+        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
 #ifdef USE_CUDA
         // CUDA-specific methods
-        .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
         .def("get_comm_stream", &deep_ep::Buffer::get_comm_stream)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
@@ -2151,9 +2161,35 @@ void deep_ep::Buffer::destroy() {
 }
 
 void deep_ep::Buffer::sync(const std::vector<int>& device_ids,
-                           const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
-                           const std::optional<pybind11::bytearray>& root_unique_id_opt) {
-    // XPU stub - TODO: implement XPU-specific synchronization
+                  const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
+                  const std::optional<pybind11::bytearray>& root_unique_id_opt) {
+    EP_HOST_ASSERT(not is_available());
+
+    // Sync IPC handles
+    if (num_nvl_bytes > 0) {
+        EP_HOST_ASSERT(num_ranks == device_ids.size());
+        EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
+        for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
+            EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
+            auto handle_str = std::string(all_gathered_handles[offset + i].value());
+            EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
+            if (offset + i != rank) {
+                // 复制远程的 IPC 句柄到本地数组
+                std::memcpy(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
+                shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
+                barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
+            } else {
+                EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
+            }
+        }
+
+        // Copy all buffer and barrier signal pointers to GPU using SYCL
+        comm_stream.memcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS);
+        comm_stream.memcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS);
+        comm_stream.wait();
+    }
+
+    // Ready to use
     available = true;
 }
 

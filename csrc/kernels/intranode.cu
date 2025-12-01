@@ -8,23 +8,27 @@ namespace deep_ep {
 
 namespace intranode {
 
+// launch 1 + num_ranks 个block，每个block 128 rank
 // 用来计算dispatch 和combine阶段所需要的metadata
+// sm0 使用IPC 进行隐式的内存通信
 template <int kNumRanks>
-__global__ void notify_dispatch(const int* num_tokens_per_rank,
-                                int* moe_recv_counter_mapped,
-                                const int* num_tokens_per_expert,
-                                int* moe_recv_expert_counter_mapped,
-                                int num_experts,
-                                int num_tokens,
-                                int num_channels,
-                                const bool* is_token_in_rank,
-                                int* channel_prefix_matrix,
-                                int* rank_prefix_matrix_copy,
-                                int num_memset_int,
-                                int expert_alignment,
-                                void** buffer_ptrs,
-                                int** barrier_signal_ptrs,
-                                int rank) {
+__global__ void notify_dispatch(
+    const int* num_tokens_per_rank,           // [num_ranks] 每个rank的token数
+    int* moe_recv_counter_mapped,             // 当前rank接收的总token数
+    const int* num_tokens_per_expert,         // [num_experts] 每个expert的token数
+    int* moe_recv_expert_counter_mapped,      // [num_experts_per_rank] 当前rank的expert收到的token数
+    int num_experts,
+    int num_tokens,                           // 全局token总数
+    int num_channels,                         // dispatch的channel数
+    const bool* is_token_in_rank,             // [num_tokens, num_ranks] 路由表
+    int* channel_prefix_matrix,               // [num_ranks, num_channels] 输出：每个rank-channel对的token数
+    int* rank_prefix_matrix_copy,             // [num_ranks, num_ranks] 输出：rank间前缀和
+    int num_memset_int,
+    int expert_alignment,
+    void** buffer_ptrs,                       // 所有rank的GPU缓冲区指针
+    int** barrier_signal_ptrs,                // 所有rank的barrier信号指针
+    int rank
+    ) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % 32, warp_id = thread_id / 32, num_warps = num_threads / 32;
@@ -34,12 +38,16 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
         int *per_rank_buffer, *per_expert_buffer;
+        // 每个线程负责一个rank
         if (thread_id < kNumRanks) {
+            // 创建了一个 rank to rank 的list
             per_rank_buffer = static_cast<int*>(buffer_ptrs[thread_id]);
+            // rank i to local expert j 的token数
             per_expert_buffer = per_rank_buffer + kNumRanks * kNumRanks;
         }
 
         // After this loop:
+        // 这里每个rank 只会写自己rank对应的行，所以没有冲突，并且可以进行同步
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
@@ -50,6 +58,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 per_expert_buffer[rank * num_experts_per_rank + i] = num_tokens_per_expert[thread_id * num_experts_per_rank + i];
         }
 
+        // 全局的rank 全部完成了自己的数据统计
         // Wait for all ranks to be finished
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 
@@ -90,16 +99,23 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     } else {
         int dst_rank = sm_id - 1;
+        // 每个warp 处理一个channel
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+            // 计算这个channel在token空间的范围
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
             // Iterate over tokens
+            // is_token_in_rank [num_tokens, num_ranks]
             int count = 0;
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32)
                 count += is_token_in_rank[i * kNumRanks + dst_rank];
             count = warp_reduce_sum(count);
+
+            // 一个warp中的第一个线程写入结果
             if (elect_one_sync())
+                // channel 发送到 rank 上面的数量前缀和
+                // channel_prefix_matrix shape [num_ranks, num_channels]
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
         __syncthreads();
