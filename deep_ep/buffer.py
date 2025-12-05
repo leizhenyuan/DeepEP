@@ -10,7 +10,7 @@ from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
 
 USE_XPU = os.environ.get('USE_XPU', '0').lower() in ('1', 'true', 'yes')
-
+USE_CUDA = os.environ.get('USE_CUDA', '0').lower() in ('1', 'true', 'yes')
 
 class Buffer:
     """
@@ -93,21 +93,27 @@ class Buffer:
         self.explicitly_destroy = explicitly_destroy
         # shrink 让某些节点不参与专家计算
         self.enable_shrink = enable_shrink
+        print("[info] before cpp buffer init", flush=True)
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
-
+        print("[info] after cpp buffer init", flush=True)
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
         device_ids = all_gather_object(local_device_id)
-
+        print("[info] Synchronizing device IDs", device_ids, flush=True)
         # Synchronize IPC handles
-        local_ipc_handle = self.runtime.get_local_ipc_handle()
-        # 获取到所有进程的IPC handles，注意是不同node上面的
-        ipc_handles = all_gather_object(local_ipc_handle)
+        if USE_CUDA:
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            # 获取到所有进程的IPC handles，注意是不同node上面的
+            ipc_handles = all_gather_object(local_ipc_handle)
+        elif USE_XPU:
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            ipc_handles = self.runtime.all_gather_handle(local_ipc_handle, dist.barrier)
 
+        print("[info] after all gather ipc handles", ipc_handles, flush=True)
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
-        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode and not USE_XPU:
+        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode and USE_CUDA:
             # Enable IBGDA
             assert num_qps_per_rank > 0
             # todo 使用环境变量或许更好一些？
@@ -222,6 +228,27 @@ class Buffer:
             use_rdma_buffer: whether to return the RDMA buffer.
         """
         tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
+        if size is None:
+            return tensor
+
+        assert tensor.numel() >= size.numel()
+        return tensor[:size.numel()].view(size)
+
+    def get_remote_buffer_tensor(self,
+                                 target_rank: int,
+                                 dtype: torch.dtype,
+                                 size: Optional[torch.Size] = None,
+                                 offset: int = 0) -> torch.Tensor:
+        """
+        Get a remote rank's buffer as a PyTorch tensor via IPC.
+
+        Argument:
+            target_rank: the rank whose buffer to access (0 to num_nvl_ranks-1).
+            dtype: the data type (PyTorch `dtype`) for the tensor.
+            size: the slice size (by elements) to get from the buffer.
+            offset: the offset of the beginning element.
+        """
+        tensor = self.runtime.get_remote_buffer_tensor(target_rank, dtype, offset)
         if size is None:
             return tensor
 

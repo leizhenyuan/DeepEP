@@ -333,6 +333,13 @@ public:
 #elif defined(USE_XPU)
     // XPU-specific methods
     sycl::queue get_comm_queue() const;
+    torch::Tensor get_remote_buffer_tensor(int target_rank, const pybind11::object& dtype, int64_t offset) const;
+    
+    // XPU IPC handle exchange using Ring AllGather pattern
+    // Returns all gathered IPC handles from all ranks via Unix socket file descriptor passing
+    std::vector<std::optional<pybind11::bytearray>> all_gather_handle(
+        const pybind11::bytearray& local_ipc_handle,
+        const pybind11::function& barrier_func);
     
     // Future: XPU internode communication methods when ISHMEM is ready
     // std::tuple<...> internode_dispatch(...);  // TODO: Implement with ISHMEM

@@ -20,6 +20,12 @@
 #include <level_zero/ze_api.h>
 #include "sycl/configs.h"
 #include "sycl/config.hpp"
+// Unix socket headers for IPC handle exchange
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <pwd.h>
+#include <cstring>
 #endif
 
 namespace shared_memory {
@@ -277,6 +283,12 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(not use_fabric and "XPU does not support fabric mode yet");
     comm_stream = sycl::queue(sycl::gpu_selector_v,
                             sycl::property::queue::in_order{});
+    sycl::device current_device = comm_stream.get_device();
+    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+    // Find the index of current device in the list
+    // alert: assume rank equals to device_id
+    // todo: provide a sycl way to get device id
+    device_id = rank;
 #endif
 
     // Metadata memory
@@ -308,8 +320,6 @@ Buffer::Buffer(int rank,
     // Get device info
 #ifdef USE_XPU
     // Get device info
-    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-    sycl::device current_device = devices[device_id];
     num_device_sms = current_device.get_info<sycl::info::device::max_compute_units>();
 #endif
 
@@ -326,16 +336,19 @@ Buffer::Buffer(int rank,
     // intra-node
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
+        std::cout << "[info] Allocating local IPC memory for NVL buffer..." << std::endl;
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
                                        num_nvl_bytes + // 数据buffer
                                        barrier_signal_bytes + // 屏障信号
                                        buffer_ptr_bytes + // 缓冲区
                                        barrier_signal_ptr_bytes); // 屏障信号指针数组
         // 创建ipc handle
+        std::cout << "[info] Creating IPC handle for NVL buffer..." << std::endl;
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
         // Set barrier signals
+        std::cout << "[info] Setting barrier signals for NVL buffer..." << std::endl;
         barrier_signal_ptrs[nvl_rank] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes);
         barrier_signal_ptrs_gpu =
             reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
@@ -344,6 +357,7 @@ Buffer::Buffer(int rank,
 #ifdef USE_CUDA
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
 #elif defined(USE_XPU)
+        std::cout << "[info] Setting barrier signals for NVL buffer (XPU)..." << std::endl;
         comm_stream.memset(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes).wait();
 #endif
     }
@@ -2135,6 +2149,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #elif defined(USE_XPU)
         // XPU-specific methods
         .def("get_comm_queue", &deep_ep::Buffer::get_comm_queue)
+        .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("get_remote_buffer_tensor", &deep_ep::Buffer::get_remote_buffer_tensor,
+             py::arg("target_rank"),
+             py::arg("dtype"),
+             py::arg("offset") = 0)
+        .def("all_gather_handle", &deep_ep::Buffer::all_gather_handle,
+             py::arg("local_ipc_handle"),
+             py::arg("barrier_func"))
 #endif
         ;
 
@@ -2163,6 +2185,7 @@ void deep_ep::Buffer::destroy() {
 void deep_ep::Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
+    std::cout << "[XPU] Initializing intranode communication buffer..." << std::endl;
     EP_HOST_ASSERT(not is_available());
 
     // Sync IPC handles
@@ -2179,6 +2202,8 @@ void deep_ep::Buffer::sync(const std::vector<int>& device_ids,
                 shared_memory_allocator.open_mem_handle(&buffer_ptrs[i], &ipc_handles[i]);
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
+                std::cout << "[XPU] Local NVL IPC handle at rank " << rank << ": " << handle_str << std::endl;
+                std::cout << "[XPU] Local NVL buffer pointer: " << &ipc_handles[i] << std::endl;
                 EP_HOST_ASSERT(std::memcmp(&ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
             }
         }
@@ -2188,7 +2213,7 @@ void deep_ep::Buffer::sync(const std::vector<int>& device_ids,
         comm_stream.memcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS);
         comm_stream.wait();
     }
-
+    std::cout << "[XPU] Intranode communication buffer is ready." << std::endl;
     // Ready to use
     available = true;
 }
@@ -2261,6 +2286,305 @@ deep_ep::Buffer::get_dispatch_layout(const torch::Tensor& topk_idx,
 sycl::queue deep_ep::Buffer::get_comm_queue() const {
     // XPU stub implementation - return the communication stream/queue
     return comm_stream;
+}
+
+torch::Tensor deep_ep::Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const {
+    torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
+    auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
+    auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
+    auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
+    return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kXPU));
+}
+
+torch::Tensor deep_ep::Buffer::get_remote_buffer_tensor(int target_rank, const pybind11::object& dtype, int64_t offset) const {
+    EP_HOST_ASSERT(target_rank >= 0 && target_rank < num_nvl_ranks && "Invalid target rank");
+    EP_HOST_ASSERT(buffer_ptrs[target_rank] != nullptr && "Remote buffer not mapped");
+    
+    torch::ScalarType casted_dtype = torch::python::detail::py_object_to_dtype(dtype);
+    auto element_bytes = static_cast<int64_t>(elementSize(casted_dtype));
+    auto base_ptr = static_cast<uint8_t*>(buffer_ptrs[target_rank]) + offset;
+    return torch::from_blob(base_ptr, num_nvl_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kXPU));
+}
+
+// ============ XPU Ring AllGather IPC Handle Implementation ============
+// Helper structures and functions for passing file descriptors via Unix sockets
+
+namespace {
+
+// Helper structure for passing file descriptors via Unix sockets
+struct exchange_fd {
+    char obscure[CMSG_LEN(sizeof(int)) - sizeof(int)];
+    int fd;
+
+    exchange_fd(int cmsg_level, int cmsg_type, int fd) : fd(fd) {
+        auto* cmsg = reinterpret_cast<cmsghdr*>(obscure);
+        cmsg->cmsg_len = sizeof(exchange_fd);
+        cmsg->cmsg_level = cmsg_level;
+        cmsg->cmsg_type = cmsg_type;
+    }
+
+    exchange_fd() : fd(-1) {
+        memset(obscure, 0, sizeof(obscure));
+    }
+};
+
+// Data structure: store IPC information for each rank
+struct IpcInfo {
+    int fd;           // File descriptor
+    size_t size;      // Memory size
+    int rank;         // Which rank this came from
+    
+    IpcInfo() : fd(-1), size(0), rank(-1) {}
+    IpcInfo(int fd, size_t size, int rank) 
+        : fd(fd), size(size), rank(rank) {}
+};
+
+// Send file descriptor over Unix socket using SCM_RIGHTS mechanism
+void send_fd(int sock, int fd, int rank, size_t size) {
+    iovec iov[1];
+    msghdr msg;
+    auto rank_size = std::make_pair(rank, size);
+
+    // Attach rank and size as regular data
+    iov[0].iov_base = &rank_size;
+    iov[0].iov_len = sizeof(rank_size);
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+    msg.msg_name = nullptr;
+    msg.msg_namelen = 0;
+
+    // Attach file descriptor as ancillary data (control message)
+    exchange_fd cmsg(SOL_SOCKET, SCM_RIGHTS, fd);
+    msg.msg_control = &cmsg;
+    msg.msg_controllen = sizeof(exchange_fd);
+    
+    if (sendmsg(sock, &msg, 0) == -1) {
+        throw std::runtime_error("sendmsg failed: " + std::string(strerror(errno)));
+    }
+}
+
+// Receive file descriptor from Unix socket
+IpcInfo recv_fd(int sock) {
+    iovec iov[1];
+    msghdr msg;
+    std::pair<int, size_t> rank_size;
+
+    iov[0].iov_base = &rank_size;
+    iov[0].iov_len = sizeof(rank_size);
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+    msg.msg_name = nullptr;
+    msg.msg_namelen = 0;
+
+    exchange_fd cmsg;
+    msg.msg_control = &cmsg;
+    msg.msg_controllen = sizeof(exchange_fd);
+    
+    if (recvmsg(sock, &msg, 0) == -1) {
+        throw std::runtime_error("recvmsg failed: " + std::string(strerror(errno)));
+    }
+
+    return IpcInfo(cmsg.fd, rank_size.second, rank_size.first);
+}
+
+// Create Unix domain socket server for receiving IPC handles
+int create_server_socket(const char* sockname) {
+    unlink(sockname);  // Remove old socket file if exists
+    
+    sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sockname, sizeof(addr.sun_path) - 1);
+
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock == -1) {
+        throw std::runtime_error("socket creation failed: " + std::string(strerror(errno)));
+    }
+
+    auto size = offsetof(sockaddr_un, sun_path) + strlen(addr.sun_path);
+    if (bind(sock, (sockaddr*)&addr, size) == -1) {
+        close(sock);
+        throw std::runtime_error("bind failed: " + std::string(strerror(errno)));
+    }
+
+    if (listen(sock, 10) == -1) {
+        close(sock);
+        throw std::runtime_error("listen failed: " + std::string(strerror(errno)));
+    }
+
+    return sock;
+}
+
+// Connect to remote rank's socket server
+int connect_to_server(const char* sockname) {
+    sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sockname, sizeof(addr.sun_path) - 1);
+
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock == -1) {
+        throw std::runtime_error("socket creation failed: " + std::string(strerror(errno)));
+    }
+
+    auto len = offsetof(sockaddr_un, sun_path) + strlen(addr.sun_path);
+    
+    // Retry connection with timeout (remote server may not be ready yet)
+    for (int i = 0; i < 50; i++) {
+        if (connect(sock, (sockaddr*)&addr, len) == 0) {
+            return sock;
+        }
+        usleep(100000); // 100ms
+    }
+    
+    close(sock);
+    throw std::runtime_error("connect failed after retries: " + std::string(strerror(errno)));
+}
+
+}  // anonymous namespace
+
+// Ring AllGather: collect IPC handles from all ranks using Ring pattern
+std::vector<std::optional<pybind11::bytearray>> deep_ep::Buffer::all_gather_handle(
+    const pybind11::bytearray& local_ipc_handle,
+    const pybind11::function& barrier_func) {
+
+    std::vector<std::optional<pybind11::bytearray>> result(num_nvl_ranks);
+
+    // Parse local IPC handle
+    const char* local_data = PyByteArray_AS_STRING(local_ipc_handle.ptr());
+    size_t local_size = PyByteArray_GET_SIZE(local_ipc_handle.ptr());
+    
+    EP_HOST_ASSERT(local_size == sizeof(shared_memory::MemHandle) && 
+                   "Invalid IPC handle size");
+
+    const shared_memory::MemHandle* local_mem_handle = 
+        reinterpret_cast<const shared_memory::MemHandle*>(local_data);
+    
+    // Extract file descriptor from ze_ipc_mem_handle_t
+    // The first 4 bytes of ze_ipc_mem_handle_t contain the file descriptor
+    int my_fd = *reinterpret_cast<const int*>(&local_mem_handle->inner.ze_ipc_mem_handle);
+    size_t my_size = local_mem_handle->size;
+    
+    std::cout << "[all_gather_handle] Rank " << nvl_rank << "/" << num_nvl_ranks 
+              << ": Local fd=" << my_fd << ", size=" << my_size << std::endl;
+    
+    // Store all IPC info (including own)
+    std::vector<IpcInfo> all_ipc_handles(num_nvl_ranks);
+    all_ipc_handles[nvl_rank] = IpcInfo(my_fd, my_size, nvl_rank);
+    
+    // Calculate destination and source ranks in ring
+    int dst_rank = (nvl_rank + 1) % num_nvl_ranks;  // Send destination
+    int src_rank = (nvl_rank + num_nvl_ranks - 1) % num_nvl_ranks;  // Receive source
+    
+    // Get username for socket naming
+    uid_t uid = getuid();
+    struct passwd* pwd = getpwuid(uid);
+    const char* username = pwd ? pwd->pw_name : "unknown";
+    
+    // Create server socket
+    char server_name[256];
+    snprintf(server_name, sizeof(server_name), 
+             "/tmp/deep_ep_ipc_ring_rank_%d_%s", nvl_rank, username);
+    
+    int server_sock = create_server_socket(server_name);
+    std::cout << "[all_gather_handle] Rank " << nvl_rank 
+              << ": Created server at " << server_name << std::endl;
+    
+    // Synchronize: ensure all servers are created
+    barrier_func();
+    
+    // Connect to destination rank's server (for sending)
+    char dst_server[256];
+    snprintf(dst_server, sizeof(dst_server),
+             "/tmp/deep_ep_ipc_ring_rank_%d_%s", dst_rank, username);
+    
+    int send_sock = connect_to_server(dst_server);
+    std::cout << "[all_gather_handle] Rank " << nvl_rank 
+              << ": Connected to rank " << dst_rank << " for sending" << std::endl;
+    
+    // Synchronize before accepting
+    barrier_func();
+    
+    // Accept connection from source rank (for receiving)
+    int recv_sock = accept(server_sock, nullptr, nullptr);
+    if (recv_sock == -1) {
+        close(server_sock);
+        close(send_sock);
+        unlink(server_name);
+        throw std::runtime_error("accept failed: " + std::string(strerror(errno)));
+    }
+    std::cout << "[all_gather_handle] Rank " << nvl_rank 
+              << ": Accepted connection from rank " << src_rank << std::endl;
+    
+    // Synchronize: ensure all connections are established
+    barrier_func();
+    
+    // Start Ring AllGather: N-1 steps to collect all handles
+    IpcInfo current_ipc = all_ipc_handles[nvl_rank];
+    
+    for (int step = 1; step < num_nvl_ranks; ++step) {
+        std::cout << "[all_gather_handle] Rank " << nvl_rank << ": Step " << step 
+                  << " - Sending fd=" << current_ipc.fd 
+                  << " (from_rank=" << current_ipc.rank << ")" << std::endl;
+        
+        // Send current IPC info to next rank
+        send_fd(send_sock, current_ipc.fd, current_ipc.rank, current_ipc.size);
+        
+        // Receive IPC info from previous rank
+        IpcInfo received = recv_fd(recv_sock);
+        
+        std::cout << "[all_gather_handle] Rank " << nvl_rank << ": Step " << step 
+                  << " - Received fd=" << received.fd 
+                  << " (from_rank=" << received.rank << ")" << std::endl;
+        
+        // Store received IPC info
+        all_ipc_handles[received.rank] = received;
+        
+        // Next step: send what we just received
+        current_ipc = received;
+        
+        // Synchronize before next step
+        barrier_func();
+    }
+    
+    // Cleanup sockets
+    close(send_sock);
+    close(recv_sock);
+    close(server_sock);
+    unlink(server_name);
+    
+    std::cout << "[all_gather_handle] Rank " << nvl_rank 
+              << ": Ring AllGather completed, collected " << num_nvl_ranks 
+              << " IPC handles" << std::endl;
+    
+    // Convert IpcInfo to pybind11::bytearray format
+    for (int i = 0; i < num_nvl_ranks; ++i) {
+        if (i == nvl_rank) {
+            // For local rank, use the original IPC handle (not reconstructed)
+            // This ensures the full ze_ipc_mem_handle_t structure is preserved
+            result[i] = pybind11::bytearray(local_data, local_size);
+            std::cout << "[all_gather_handle] Rank " << nvl_rank 
+                      << ": Result[" << i << "] = original local handle (fd=" << my_fd 
+                      << ", size=" << my_size << ")" << std::endl;
+        } else {
+            // For remote ranks, construct MemHandle with the received fd
+            shared_memory::MemHandle mem_handle;
+            memset(&mem_handle, 0, sizeof(mem_handle));
+            
+            // Reconstruct ze_ipc_mem_handle_t from file descriptor
+            *reinterpret_cast<int*>(&mem_handle.inner.ze_ipc_mem_handle) = all_ipc_handles[i].fd;
+            mem_handle.size = all_ipc_handles[i].size;
+            
+            result[i] = pybind11::bytearray(reinterpret_cast<const char*>(&mem_handle), 
+                                             sizeof(mem_handle));
+            
+            std::cout << "[all_gather_handle] Rank " << nvl_rank 
+                      << ": Result[" << i << "] fd=" << all_ipc_handles[i].fd 
+                      << ", size=" << all_ipc_handles[i].size << std::endl;
+        }
+    }
+    
+    return result;
 }
 
 #endif // USE_XPU
