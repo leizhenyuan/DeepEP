@@ -621,7 +621,11 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     
     constexpr size_t MAX_SPIN = 10000000;
     
-    if (lane_id == 0 && debug_stream && sg_id < kNumRanks) {
+    // if (lane_id == 0 && debug_stream && sg_id < kNumRanks) {
+    //     *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
+    //                  << "] sg_id=" << sg_id << ", lane_id=" << lane_id << sycl::endl;
+    // }
+    if (thread_id < kNumRanks) {
         *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
                      << "] sg_id=" << sg_id << ", lane_id=" << lane_id << sycl::endl;
     }
@@ -634,14 +638,15 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     size_t add_spins = 0;
     size_t sub_spins = 0;
 
-    if (sg_id < kNumRanks && lane_id == 0) {
-        // ========== Step 1: Put signal to self slot (0 -> FINISHED_SUM_TAG) ==========
-        int* self_ptr = barrier_signal_ptrs[rank] + sg_id;
+    // if (sg_id < kNumRanks && lane_id == 0) {
+    if (thread_id < kNumRanks) {
+        // ========== Step 1: Put signal to self slot (0 -> rank * 1000 + thread_id) ==========
+        int* self_ptr = barrier_signal_ptrs[rank] + thread_id;
         sycl::atomic_ref<int,
                          sycl::memory_order::acq_rel,
                          sycl::memory_scope::system> self_ref(*self_ptr);
 
-        int add_tag = rank * 1000 + sg_id;
+        int add_tag = rank * 1000 + thread_id;
         for (size_t i = 0; i < MAX_SPIN; ++i) {
             int expected = 0;
             if (self_ref.compare_exchange_strong(expected, add_tag)) {
@@ -651,8 +656,8 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
         }
         
         if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << lane_id 
-                         << "] ADD_SELF: [" << rank << "][" << sg_id 
+            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
+                         << "] ADD_SELF: [" << rank << "][" << thread_id 
                          << "] 0 -> " << add_tag 
                          << ", spins=" << add_spins << sycl::endl;
         }
@@ -660,17 +665,17 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     
     item.barrier(sycl::access::fence_space::global_space);
 
-    bool self_done = (sg_id < kNumRanks && lane_id == 0) ? false : true;  
+    bool self_done = (thread_id < kNumRanks && lane_id == 0) ? false : true;  
   
-    if (sg_id < kNumRanks && lane_id == 0) {
+    if (thread_id < kNumRanks) {
         // ========== Step 2: Wait signal from other slot (FINISHED_SUM_TAG -> 0) ==========
-        int* other_ptr = barrier_signal_ptrs[sg_id] + rank;
+        int* other_ptr = barrier_signal_ptrs[thread_id] + rank;
         sycl::atomic_ref<int,
                          sycl::memory_order::acq_rel,
                          sycl::memory_scope::system> other_ref(*other_ptr);
-        int sub_tag = sg_id * 1000 + rank;
+        int sub_tag = thread_id * 1000 + rank;
         for (size_t i = 0; i < MAX_SPIN; ++i) {
-            sub_tag = sg_id * 1000 + rank;
+            sub_tag = thread_id * 1000 + rank;
             if (other_ref.compare_exchange_strong(sub_tag, 0)) {
                 self_done = true;
                 break;
@@ -679,8 +684,8 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
         }
         
         if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << sg_id 
-                         << "] SUB_OTHER: [" << sg_id << "][" << rank 
+            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
+                         << "] SUB_OTHER: [" << thread_id << "][" << rank 
                          << "] " << sub_tag << " -> 0"
                          << ", spins=" << sub_spins 
                          << ", self_done=" << (self_done ? 1 : 0) << sycl::endl;
@@ -702,7 +707,6 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
                          << "] TIMEOUT: sub_spins=" << sub_spins << sycl::endl;
         }
         item.barrier(sycl::access::fence_space::local_space);
-        // Abort - 在 SYCL 中无法直接 abort，但可以让 host 检测到失败
         return;
     }
     
