@@ -76,7 +76,9 @@ class Buffer:
 
             def all_gather_object(obj):
                 object_list = [None] * self.group_size
+                print("before all gather", flush=True)
                 dist.all_gather_object(object_list, obj, group)
+                print("after all gather", flush=True)
                 return object_list
         elif comm is not None:
             self.rank = comm.Get_rank()
@@ -99,6 +101,7 @@ class Buffer:
         print("[info] after cpp buffer init", flush=True)
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
+        print("[info] here? before all gather device ids", local_device_id, flush=True)
         device_ids = all_gather_object(local_device_id)
         print("[info] Synchronizing device IDs", device_ids, flush=True)
         # Synchronize IPC handles
@@ -417,8 +420,12 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         # Default config
+        import logging
+        logging.basicConfig(level=logging.DEBUG, 
+                   format=f'[Rank {self.rank}] %(asctime)s - %(message)s')
+        logging.debug(f"[Rank {self.rank}] Before dispatch config")
         config = self.get_dispatch_config(self.group_size) if config is None else config
-
+        logging.debug(f"[Rank {self.rank}] After dispatch config: {config}")
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1 and not USE_XPU:
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
@@ -431,17 +438,24 @@ class Buffer:
             assert topk_idx is None and topk_weights is None
             rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
             num_recv_tokens = recv_src_idx.size(0)
+            logging.debug(f"[Rank {self.rank}] Before intranode dispatch dispatch with handle")
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
                 x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            logging.debug(f"[Rank {self.rank}] After intranode dispatch dispatch with handle")
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
+            logging.debug(f"[Rank {self.rank}] Before intranode dispatch dispatch no handle")
+            (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, 
+             num_recv_tokens_per_expert_list, rank_prefix_matrix, 
+             channel_prefix_matrix, recv_channel_prefix_matrix, 
+             recv_src_idx, send_head, event) = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                                 expert_alignment, num_worst_tokens, config,
                                                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            logging.debug(f"[Rank {self.rank}] After intranode dispatch dispatch no handle")
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             return (
                 recv_x, recv_x_scales

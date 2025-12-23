@@ -508,6 +508,7 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
 
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
+        // system level acquire-release fence
         memory_fence();
         __syncthreads();
     }
@@ -522,7 +523,9 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     // Check timeout
     auto start_time = clock64();
     while (true) {
+        // global volatile load 为了显存一致性
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
+        // 为什么会小于0呢？
         if (__all_sync(0xffffffff, value <= 0))
             break;
 

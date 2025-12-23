@@ -341,6 +341,15 @@ public:
         const pybind11::bytearray& local_ipc_handle,
         const pybind11::function& barrier_func);
     
+    // IPC mapping test methods - 用于测试 IPC 地址映射是否正确
+    // test_ipc_write: 写入测试值 rank*1000+thread_id 到 barrier_signal_ptrs[rank]+thread_id
+    // test_ipc_read: 读取 barrier_signal_ptrs[thread_id]+rank 并验证值是否为 thread_id*1000+rank
+    void test_ipc_write();
+    void test_ipc_read();
+    
+    // test_barrier: 测试 barrier_block_cas 跨 GPU 同步
+    void test_barrier();
+    
     // Future: XPU internode communication methods when ISHMEM is ready
     // std::tuple<...> internode_dispatch(...);  // TODO: Implement with ISHMEM
     // std::tuple<...> internode_combine(...);   // TODO: Implement with ISHMEM
