@@ -111,7 +111,14 @@ class Buffer:
             ipc_handles = all_gather_object(local_ipc_handle)
         elif USE_XPU:
             local_ipc_handle = self.runtime.get_local_ipc_handle()
-            ipc_handles = self.runtime.all_gather_handle(local_ipc_handle, dist.barrier)
+            # 根据初始化方式选择 barrier 函数
+            if comm is not None:
+                # MPI 模式：使用 MPI barrier（硬同步，更精确）
+                barrier_func = comm.Barrier
+            else:
+                # PyTorch 分布式模式：使用 dist.barrier
+                barrier_func = dist.barrier
+            ipc_handles = self.runtime.all_gather_handle(local_ipc_handle, barrier_func)
 
         print("[info] after all gather ipc handles", ipc_handles, flush=True)
         # Synchronize NVSHMEM unique IDs

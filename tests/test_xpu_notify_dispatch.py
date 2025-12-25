@@ -12,6 +12,9 @@ Usage:
     
     # Test both
     python tests/test_xpu_notify_dispatch.py --num-processes 2 --test all
+    
+    # Use MPI (recommended for xccl backend)
+    mpirun -np 2 python tests/test_xpu_notify_dispatch.py --use-mpi --test direct
 """
 
 import argparse
@@ -22,55 +25,152 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+# MPI 条件导入
+try:
+    from mpi4py import MPI
+    HAS_MPI = True
+except ImportError:
+    HAS_MPI = False
+    MPI = None
 
-def test_notify_dispatch_direct(local_rank: int, num_ranks: int, args):
+
+def init_dist_mpi(port: int = 29556, use_gloo: bool = False):
+    """使用 MPI 初始化分布式环境
+    
+    Args:
+        port: 分布式通信端口
+        use_gloo: 是否强制使用 gloo 后端
+    """
+    if not HAS_MPI:
+        raise RuntimeError("mpi4py is not installed. Please install with: pip install mpi4py")
+    
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+    
+    # 设置 XPU 设备
+    local_rank = rank
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        torch.xpu.set_device(local_rank)
+        device = f'xpu:{local_rank}'
+        backend = 'gloo' if use_gloo else 'xccl'
+    else:
+        device = 'cpu'
+        backend = 'gloo'
+        print(f"[Warning] XPU not available, using {device}")
+    
+    # 设置环境变量
+    os.environ['MASTER_ADDR'] = os.getenv('MASTER_ADDR', '127.0.0.1')
+    os.environ['MASTER_PORT'] = str(port)
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    
+    # 初始化 PyTorch 分布式
+    try:
+        dist.init_process_group(
+            backend=backend,
+            init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{port}',
+            world_size=world_size,
+            rank=rank
+        )
+    except Exception as e:
+        print(f"[Warning] Failed to init with {backend}, trying gloo: {e}")
+        dist.init_process_group(
+            backend='gloo',
+            init_method=f'tcp://{os.environ["MASTER_ADDR"]}:{port}',
+            world_size=world_size,
+            rank=rank
+        )
+    
+    group = dist.new_group(list(range(world_size)))
+    return rank, world_size, group, device, comm
+
+
+def init_dist_spawn(local_rank: int, num_ranks: int, port: int = 29556):
+    """使用 mp.spawn 初始化分布式环境"""
+    # 设置 XPU 设备
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        torch.xpu.set_device(local_rank)
+        device = f'xpu:{local_rank}'
+        backend = 'xccl'
+    else:
+        device = 'cpu'
+        backend = 'gloo'
+        print(f"[Warning] XPU not available, using {device}")
+    
+    # 设置环境变量
+    os.environ['RANK'] = str(local_rank)
+    os.environ['LOCAL_RANK'] = str(local_rank)
+    os.environ['WORLD_SIZE'] = str(num_ranks)
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = str(port)
+    
+    # 初始化 PyTorch 分布式
+    try:
+        dist.init_process_group(
+            backend=backend,
+            init_method='env://',
+            world_size=num_ranks,
+            rank=local_rank
+        )
+    except Exception as e:
+        print(f"[Warning] Failed to init with {backend}, trying gloo: {e}")
+        dist.init_process_group(
+            backend='gloo',
+            init_method='env://',
+            world_size=num_ranks,
+            rank=local_rank
+        )
+    
+    group = dist.group.WORLD
+    return local_rank, num_ranks, group, device, None
+
+
+def test_notify_dispatch_direct(rank: int, num_ranks: int, group, device: str, mpi_comm, args):
     """
     Test notify_dispatch kernel directly using the new test_notify_dispatch method.
     This bypasses the full dispatch path and tests the kernel in isolation.
     """
     import deep_ep
     
-    # Set XPU device
-    torch.xpu.set_device(local_rank)
-    device = f'xpu:{local_rank}'
+    use_mpi = mpi_comm is not None
     
-    # Set environment variables
-    os.environ['RANK'] = str(local_rank)
-    os.environ['LOCAL_RANK'] = str(local_rank)
-    os.environ['WORLD_SIZE'] = str(num_ranks)
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(args.port)
+    def cpu_barrier():
+        if use_mpi:
+            mpi_comm.Barrier()
+        else:
+            dist.barrier(group=group)
     
-    # Initialize process group
-    print(f"[Rank {local_rank}] Initializing process group...", flush=True)
-    dist.init_process_group(
-        backend='xccl',
-        init_method='env://',
-        world_size=num_ranks,
-        rank=local_rank
-    )
-    print(f"[Rank {local_rank}] Process group initialized", flush=True)
-    
-    group = dist.group.WORLD
-    dist.barrier()
+    cpu_barrier()
     
     # ========== Create Buffer ==========
-    if local_rank == 0:
+    if rank == 0:
         print("\n[Setup] Creating DeepEP Buffer...", flush=True)
     
-    buffer = deep_ep.Buffer(
-        group,
-        int(2e8),  # 200MB NVL buffer
-        num_rdma_bytes=0,
-        low_latency_mode=False,
-        num_qps_per_rank=1,
-        explicitly_destroy=True
-    )
+    if use_mpi:
+        buffer = deep_ep.Buffer(
+            group,
+            int(2e8),  # 200MB NVL buffer
+            num_rdma_bytes=0,
+            low_latency_mode=False,
+            num_qps_per_rank=1,
+            explicitly_destroy=True,
+            comm=mpi_comm
+        )
+    else:
+        buffer = deep_ep.Buffer(
+            group,
+            int(2e8),  # 200MB NVL buffer
+            num_rdma_bytes=0,
+            low_latency_mode=False,
+            num_qps_per_rank=1,
+            explicitly_destroy=True
+        )
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"[Setup] Buffer created: rank={buffer.rank}, num_ranks={buffer.group_size}", flush=True)
     
-    dist.barrier()
+    cpu_barrier()
     
     # ========== Test Parameters ==========
     num_tokens = args.num_tokens
@@ -78,7 +178,7 @@ def test_notify_dispatch_direct(local_rank: int, num_ranks: int, args):
     num_channels = args.num_channels
     expert_alignment = args.expert_alignment
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test Direct] Parameters:", flush=True)
         print(f"  num_tokens={num_tokens}", flush=True)
         print(f"  num_experts={num_experts}", flush=True)
@@ -88,7 +188,7 @@ def test_notify_dispatch_direct(local_rank: int, num_ranks: int, args):
     
     # ========== Generate Test Data ==========
     # Use fixed seed for reproducibility
-    torch.manual_seed(42 + local_rank)
+    torch.manual_seed(42 + rank)
     
     # Each token randomly selects one expert
     token_expert_idx = torch.randint(0, num_experts, (num_tokens,), device=device)
@@ -111,15 +211,15 @@ def test_notify_dispatch_direct(local_rank: int, num_ranks: int, args):
         expert_idx = token_expert_idx[i].item()
         num_tokens_per_expert[expert_idx] += 1
     
-    print(f"[Rank {local_rank}] Generated test data:", flush=True)
+    print(f"[Rank {rank}] Generated test data:", flush=True)
     print(f"  num_tokens_per_rank: {num_tokens_per_rank.tolist()}", flush=True)
     print(f"  num_tokens_per_expert: {num_tokens_per_expert.tolist()}", flush=True)
     
     torch.xpu.synchronize()
-    dist.barrier()
+    cpu_barrier()
     
     # ========== Call test_notify_dispatch ==========
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test Direct] Calling test_notify_dispatch...", flush=True)
     
     start_time = time.time()
@@ -137,76 +237,58 @@ def test_notify_dispatch_direct(local_rank: int, num_ranks: int, args):
             )
         
         elapsed = time.time() - start_time
-        print(f"[Rank {local_rank}] test_notify_dispatch completed in {elapsed*1000:.2f} ms", flush=True)
+        print(f"[Rank {rank}] test_notify_dispatch completed in {elapsed*1000:.2f} ms", flush=True)
         
         # Print results
-        print(f"[Rank {local_rank}] Results:", flush=True)
+        print(f"[Rank {rank}] Results:", flush=True)
         print(f"  moe_recv_count: {moe_recv_count}", flush=True)
         print(f"  expert_counts: {expert_counts}", flush=True)
         
         # Verify moe_recv_count
         # This should equal the sum of tokens sent to this rank from all ranks
-        # In the single-machine case with local data, it should equal num_tokens_per_rank[local_rank]
-        expected_recv_count = num_tokens_per_rank[local_rank].item()
+        # In the single-machine case with local data, it should equal num_tokens_per_rank[rank]
+        expected_recv_count = num_tokens_per_rank[rank].item()
         if moe_recv_count == expected_recv_count:
-            print(f"[Rank {local_rank}] moe_recv_count CORRECT! ({moe_recv_count} == {expected_recv_count})", flush=True)
+            print(f"[Rank {rank}] moe_recv_count CORRECT! ({moe_recv_count} == {expected_recv_count})", flush=True)
         else:
-            print(f"[Rank {local_rank}] moe_recv_count MISMATCH! (got {moe_recv_count}, expected {expected_recv_count})", flush=True)
+            print(f"[Rank {rank}] moe_recv_count MISMATCH! (got {moe_recv_count}, expected {expected_recv_count})", flush=True)
         
         # Print matrices
-        print(f"[Rank {local_rank}] rank_prefix_matrix:", flush=True)
+        print(f"[Rank {rank}] rank_prefix_matrix:", flush=True)
         print(rank_prefix_matrix.cpu(), flush=True)
-        print(f"[Rank {local_rank}] channel_prefix_matrix:", flush=True)
+        print(f"[Rank {rank}] channel_prefix_matrix:", flush=True)
         print(channel_prefix_matrix.cpu(), flush=True)
         
     except Exception as e:
-        print(f"[Rank {local_rank}] ERROR during test_notify_dispatch: {e}", flush=True)
+        print(f"[Rank {rank}] ERROR during test_notify_dispatch: {e}", flush=True)
         import traceback
         traceback.print_exc()
         raise
     
     torch.xpu.synchronize()
-    dist.barrier()
+    cpu_barrier()
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test Direct] notify_dispatch direct test PASSED!", flush=True)
     
     # ========== Cleanup ==========
     buffer.destroy()
-    dist.barrier()
-    dist.destroy_process_group()
+    cpu_barrier()
 
 
-def test_notify_dispatch_full(local_rank: int, num_ranks: int, args):
+def test_notify_dispatch_full(rank: int, num_ranks: int, group, device, mpi_comm, args):
     """Test notify_dispatch kernel through full dispatch path"""
     import deep_ep
     
-    # Set XPU device
-    torch.xpu.set_device(local_rank)
-    device = f'xpu:{local_rank}'
+    # Set up cpu_barrier based on whether we have MPI
+    if mpi_comm is not None:
+        def cpu_barrier():
+            mpi_comm.Barrier()
+    else:
+        def cpu_barrier():
+            dist.barrier()
     
-    # Set environment variables
-    os.environ['RANK'] = str(local_rank)
-    os.environ['LOCAL_RANK'] = str(local_rank)
-    os.environ['WORLD_SIZE'] = str(num_ranks)
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(args.port + 1)  # Use different port
-    
-    # Initialize process group
-    print(f"[Rank {local_rank}] Initializing process group...", flush=True)
-    dist.init_process_group(
-        backend='xccl',
-        init_method='env://',
-        world_size=num_ranks,
-        rank=local_rank
-    )
-    print(f"[Rank {local_rank}] Process group initialized", flush=True)
-    
-    group = dist.group.WORLD
-    dist.barrier()
-    
-    # ========== Create Buffer ==========
-    if local_rank == 0:
+    if rank == 0:
         print("\n[Setup] Creating DeepEP Buffer...", flush=True)
     
     buffer = deep_ep.Buffer(
@@ -218,10 +300,10 @@ def test_notify_dispatch_full(local_rank: int, num_ranks: int, args):
         explicitly_destroy=True
     )
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"[Setup] Buffer created: rank={buffer.rank}, num_ranks={buffer.group_size}", flush=True)
     
-    dist.barrier()
+    cpu_barrier()
     
     # ========== Test Parameters ==========
     num_tokens = args.num_tokens
@@ -229,7 +311,7 @@ def test_notify_dispatch_full(local_rank: int, num_ranks: int, args):
     num_experts = args.num_experts
     num_topk = 4
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test Full] Parameters:", flush=True)
         print(f"  num_tokens={num_tokens}", flush=True)
         print(f"  hidden={hidden}", flush=True)
@@ -239,7 +321,7 @@ def test_notify_dispatch_full(local_rank: int, num_ranks: int, args):
     
     # ========== Prepare Input Data ==========
     # Create input tensor
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device) * local_rank
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device) * rank
     
     # Create topk_idx
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=device).abs() + 1
@@ -247,49 +329,49 @@ def test_notify_dispatch_full(local_rank: int, num_ranks: int, args):
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
     
     # Create topk_weights
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device=device) * local_rank
+    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device=device) * rank
     
     torch.xpu.synchronize()
-    dist.barrier()
+    cpu_barrier()
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test] Input data prepared", flush=True)
         print(f"  x.shape={x.shape}, x.dtype={x.dtype}", flush=True)
         print(f"  topk_idx.shape={topk_idx.shape}, topk_idx.dtype={topk_idx.dtype}", flush=True)
     
     # ========== Get Dispatch Layout ==========
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test] Getting dispatch layout...", flush=True)
     
     num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
     
     torch.xpu.synchronize()
-    dist.barrier()
+    cpu_barrier()
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"[Test] Layout obtained:", flush=True)
         print(f"  num_tokens_per_rank={num_tokens_per_rank.tolist()}", flush=True)
         print(f"  num_tokens_per_expert.shape={num_tokens_per_expert.shape}", flush=True)
         print(f"  is_token_in_rank.shape={is_token_in_rank.shape}", flush=True)
     
     # ========== Test Dispatch (THIS IS WHERE IT HANGS) ==========
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test] About to call buffer.dispatch()...", flush=True)
         print(f"[Test] This will trigger notify_dispatch kernel", flush=True)
     
-    dist.barrier()
+    cpu_barrier()
     
     # Set number of SMs
     num_sms = 24
     deep_ep.Buffer.set_num_sms(num_sms)
     config = deep_ep.Buffer.get_dispatch_config(num_ranks)
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"[Test Full] Config: num_sms={num_sms}, config={config}", flush=True)
     
     try:
-        print(f"[Rank {local_rank}] Calling dispatch... (should see C++ debug logs)", flush=True)
+        print(f"[Rank {rank}] Calling dispatch... (should see C++ debug logs)", flush=True)
         start_time = time.time()
         
         recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
@@ -305,60 +387,98 @@ def test_notify_dispatch_full(local_rank: int, num_ranks: int, args):
             )
         
         elapsed = time.time() - start_time
-        print(f"[Rank {local_rank}] Dispatch completed in {elapsed*1000:.2f} ms!", flush=True)
+        print(f"[Rank {rank}] Dispatch completed in {elapsed*1000:.2f} ms!", flush=True)
         
         # Verify results
-        print(f"[Rank {local_rank}] Results:", flush=True)
+        print(f"[Rank {rank}] Results:", flush=True)
         print(f"  recv_x.shape={recv_x.shape}", flush=True)
         print(f"  recv_topk_idx.shape={recv_topk_idx.shape if recv_topk_idx is not None else None}", flush=True)
         
     except Exception as e:
-        print(f"[Rank {local_rank}] ERROR during dispatch: {e}", flush=True)
+        print(f"[Rank {rank}] ERROR during dispatch: {e}", flush=True)
         import traceback
         traceback.print_exc()
         raise
     
     torch.xpu.synchronize()
-    dist.barrier()
+    cpu_barrier()
     
-    if local_rank == 0:
+    if rank == 0:
         print(f"\n[Test Full] Dispatch test PASSED!", flush=True)
     
     # ========== Cleanup ==========
-    if local_rank == 0:
+    if rank == 0:
         print("\n[Cleanup] Destroying buffer...", flush=True)
     
     buffer.destroy()
-    dist.barrier()
-    dist.destroy_process_group()
+    cpu_barrier()
     
-    if local_rank == 0:
+    if rank == 0:
         print("\n" + "=" * 50, flush=True)
         print("notify_dispatch full test completed successfully!", flush=True)
         print("=" * 50, flush=True)
 
 
 def worker_fn(local_rank: int, num_ranks: int, args):
-    """Worker function for multiprocessing"""
+    """Worker function for multiprocessing (mp.spawn mode)"""
     # Add parent directory to sys.path so subprocess can import deep_ep
     from pathlib import Path
     repo_root = Path(__file__).parent.parent.absolute()
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
     
+    # Initialize distributed backend
+    rank, world_size, group, device = init_dist_spawn(local_rank, num_ranks, args.port)
+    mpi_comm = None  # No MPI in mp.spawn mode
+    
     test_type = args.test
     
     if test_type == 'direct' or test_type == 'all':
-        test_notify_dispatch_direct(local_rank, num_ranks, args)
+        test_notify_dispatch_direct(rank, world_size, group, device, mpi_comm, args)
         
         # If running 'all', need to reinit dist after first test
-        if test_type == 'all' and local_rank == 0:
+        if test_type == 'all' and rank == 0:
             print("\n" + "=" * 60, flush=True)
             print("Direct test completed, starting full test...", flush=True)
             print("=" * 60 + "\n", flush=True)
     
     if test_type == 'full':
-        test_notify_dispatch_full(local_rank, num_ranks, args)
+        test_notify_dispatch_full(rank, world_size, group, device, mpi_comm, args)
+    
+    # Cleanup
+    dist.destroy_process_group()
+
+
+def main_mpi(args):
+    """Main function when using MPI (mpirun mode)"""
+    from pathlib import Path
+    repo_root = Path(__file__).parent.parent.absolute()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    
+    # Initialize via MPI
+    rank, world_size, group, device, mpi_comm = init_dist_mpi(args.port, use_gloo=args.use_gloo)
+    
+    test_type = args.test
+    
+    if test_type == 'direct' or test_type == 'all':
+        test_notify_dispatch_direct(rank, world_size, group, device, mpi_comm, args)
+        
+        if test_type == 'all' and rank == 0:
+            print("\n" + "=" * 60, flush=True)
+            print("Direct test completed, starting full test...", flush=True)
+            print("=" * 60 + "\n", flush=True)
+    
+    if test_type == 'full':
+        test_notify_dispatch_full(rank, world_size, group, device, mpi_comm, args)
+    
+    # Cleanup
+    dist.destroy_process_group()
+    
+    if rank == 0:
+        print("\n" + "=" * 50, flush=True)
+        print("All tests completed!", flush=True)
+        print("=" * 50, flush=True)
 
 
 def main():
@@ -378,34 +498,57 @@ def main():
                         help='Which test to run: direct (new API), full (dispatch path), all')
     parser.add_argument('--port', type=int, default=29556,
                         help='Master port for distributed communication (default: 29556)')
+    parser.add_argument('--use-mpi', action='store_true',
+                        help='Use MPI for process launch (requires mpirun)')
+    parser.add_argument('--use-gloo', action='store_true',
+                        help='Use gloo backend instead of xccl (only with --use-mpi)')
     args = parser.parse_args()
-    
-    num_processes = args.num_processes
     
     # Default num_experts
     if args.num_experts is None:
-        args.num_experts = 8 * num_processes
+        args.num_experts = 8 * args.num_processes
     
     # Validate num_experts
-    if args.num_experts % num_processes != 0:
+    if args.num_experts % args.num_processes != 0:
         print(f"Error: num_experts ({args.num_experts}) must be divisible by "
-              f"num_processes ({num_processes})")
+              f"num_processes ({args.num_processes})")
         return
     
-    print("=" * 60, flush=True)
-    print(f"DeepEP XPU notify_dispatch Test ({num_processes} GPUs)", flush=True)
-    print(f"Test mode: {args.test}", flush=True)
-    print(f"num_tokens={args.num_tokens}, num_experts={args.num_experts}", flush=True)
-    print(f"num_channels={args.num_channels}, expert_alignment={args.expert_alignment}", flush=True)
-    print("=" * 60, flush=True)
-    
-    # Spawn worker processes
-    mp.spawn(
-        worker_fn,
-        args=(num_processes, args),
-        nprocs=num_processes,
-        join=True
-    )
+    if args.use_mpi:
+        # MPI mode - processes already launched by mpirun
+        from mpi4py import MPI
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        world_size = comm.Get_size()
+        
+        if rank == 0:
+            print("=" * 60, flush=True)
+            print(f"DeepEP XPU notify_dispatch Test ({world_size} GPUs, MPI mode)", flush=True)
+            print(f"Test mode: {args.test}", flush=True)
+            print(f"Backend: {'gloo' if args.use_gloo else 'xccl'}", flush=True)
+            print(f"num_tokens={args.num_tokens}, num_experts={args.num_experts}", flush=True)
+            print(f"num_channels={args.num_channels}, expert_alignment={args.expert_alignment}", flush=True)
+            print("=" * 60, flush=True)
+        
+        main_mpi(args)
+    else:
+        # mp.spawn mode
+        num_processes = args.num_processes
+        
+        print("=" * 60, flush=True)
+        print(f"DeepEP XPU notify_dispatch Test ({num_processes} GPUs)", flush=True)
+        print(f"Test mode: {args.test}", flush=True)
+        print(f"num_tokens={args.num_tokens}, num_experts={args.num_experts}", flush=True)
+        print(f"num_channels={args.num_channels}, expert_alignment={args.expert_alignment}", flush=True)
+        print("=" * 60, flush=True)
+        
+        # Spawn worker processes
+        mp.spawn(
+            worker_fn,
+            args=(num_processes, args),
+            nprocs=num_processes,
+            join=True
+        )
 
 
 if __name__ == '__main__':

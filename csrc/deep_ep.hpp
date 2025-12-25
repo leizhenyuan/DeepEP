@@ -8,6 +8,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include <tuple>
 #include <vector>
@@ -55,6 +56,12 @@ constexpr size_t HANDLE_SIZE = sizeof(MemHandle);
 class SharedMemoryAllocator {
 public:
     SharedMemoryAllocator(bool use_fabric);
+#ifdef USE_XPU
+    // XPU: 使用外部传入的 SYCL queue 初始化，确保使用正确的设备
+    SharedMemoryAllocator(bool use_fabric, sycl::queue& queue);
+    // XPU: 延迟初始化，在 Buffer 创建 comm_stream 后调用
+    void init_from_queue(sycl::queue& queue);
+#endif
     void malloc(void** ptr, size_t size);
     void free(void* ptr);
     void get_mem_handle(MemHandle* mem_handle, void* ptr);
@@ -64,8 +71,8 @@ public:
 private:
     bool use_fabric;
 #ifdef USE_XPU
-    ze_context_handle_t ze_context;
-    ze_device_handle_t ze_device;
+    ze_context_handle_t ze_context = nullptr;
+    ze_device_handle_t ze_device = nullptr;
 #endif
 };
 }  // namespace shared_memory
@@ -348,7 +355,19 @@ public:
     void test_ipc_read();
     
     // test_barrier: 测试 barrier_block_cas 跨 GPU 同步
-    void test_barrier();
+    // process_group: 可选的 PyTorch 分布式 process group，用于 CPU barrier 同步
+    void test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group = std::nullopt);
+    
+    // test_notify_dispatch: 直接测试 notify_dispatch 内核
+    // 返回: (moe_recv_count, expert_counts, rank_prefix_matrix, channel_prefix_matrix)
+    std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> test_notify_dispatch(
+        const torch::Tensor& num_tokens_per_rank,
+        const torch::Tensor& num_tokens_per_expert,
+        const torch::Tensor& is_token_in_rank,
+        int num_tokens,
+        int num_experts,
+        int num_channels,
+        int expert_alignment);
     
     // Future: XPU internode communication methods when ISHMEM is ready
     // std::tuple<...> internode_dispatch(...);  // TODO: Implement with ISHMEM

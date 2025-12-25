@@ -2,6 +2,7 @@
 
 #include <pybind11/functional.h>
 #include <torch/python.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include <chrono>
 #include <memory>
@@ -67,6 +68,8 @@ size_t get_size_align_to_granularity(size_t size_raw, size_t granularity) {
 SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric) : use_fabric(use_fabric) {
 #ifdef USE_XPU
     // Initialize Level Zero context and device
+    // 注意：这个构造函数使用 gpu_selector_v，可能选择错误的设备
+    // 建议使用带 sycl::queue 参数的构造函数
     if (!use_fabric) {
         sycl::queue q(sycl::gpu_selector_v);
         ze_context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
@@ -74,6 +77,26 @@ SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric) : use_fabric(use_f
     }
 #endif
 }
+
+#ifdef USE_XPU
+SharedMemoryAllocator::SharedMemoryAllocator(bool use_fabric, sycl::queue& queue) : use_fabric(use_fabric) {
+    // 从传入的 queue 获取 Level Zero context 和 device
+    // 这确保了与 Buffer 的 comm_stream 使用相同的设备
+    if (!use_fabric) {
+        ze_context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(queue.get_context());
+        ze_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(queue.get_device());
+    }
+}
+
+void SharedMemoryAllocator::init_from_queue(sycl::queue& queue) {
+    // 延迟初始化：从传入的 queue 获取 Level Zero context 和 device
+    // 用于 Buffer 构造函数中，在 comm_stream 创建后调用
+    if (!use_fabric) {
+        ze_context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(queue.get_context());
+        ze_device = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(queue.get_device());
+    }
+}
+#endif
 
 void SharedMemoryAllocator::malloc(void** ptr, size_t size_raw) {
 #ifdef USE_CUDA
@@ -281,14 +304,23 @@ Buffer::Buffer(int rank,
 #ifdef USE_XPU
     // XPU does not support fabric mode yet
     EP_HOST_ASSERT(not use_fabric and "XPU does not support fabric mode yet");
-    comm_stream = sycl::queue(sycl::gpu_selector_v,
-                            sycl::property::queue::in_order{});
-    sycl::device current_device = comm_stream.get_device();
+    
+    // 根据 rank 选择正确的 GPU 设备
     auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-    // Find the index of current device in the list
-    // alert: assume rank equals to device_id
-    // todo: provide a sycl way to get device id
+    EP_HOST_ASSERT(rank < static_cast<int>(devices.size()) && 
+                   "Rank exceeds number of available GPU devices");
+    
+    // 使用 rank 对应的设备创建 queue
+    sycl::device target_device = devices[rank];
+    comm_stream = sycl::queue(target_device, sycl::property::queue::in_order{});
     device_id = rank;
+    
+    std::cout << "[Buffer] Rank " << rank << " using device: " 
+              << target_device.get_info<sycl::info::device::name>() 
+              << " (device index: " << rank << ")" << std::endl;
+    
+    // 使用 comm_stream 初始化 shared_memory_allocator，确保使用相同的设备
+    shared_memory_allocator.init_from_queue(comm_stream);
 #endif
 
     // Metadata memory
@@ -319,8 +351,8 @@ Buffer::Buffer(int rank,
 
     // Get device info
 #ifdef USE_XPU
-    // Get device info
-    num_device_sms = current_device.get_info<sycl::info::device::max_compute_units>();
+    // Get device info - 使用 comm_stream 的设备
+    num_device_sms = comm_stream.get_device().get_info<sycl::info::device::max_compute_units>();
 #endif
 
 #ifdef USE_CUDA
@@ -2171,7 +2203,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("barrier_func"))
         .def("test_ipc_write", &deep_ep::Buffer::test_ipc_write)
         .def("test_ipc_read", &deep_ep::Buffer::test_ipc_read)
-        .def("test_barrier", &deep_ep::Buffer::test_barrier)
+        .def("test_barrier", &deep_ep::Buffer::test_barrier,
+             py::arg("process_group") = std::nullopt,
+             "Test barrier synchronization across GPUs. Optionally provide a ProcessGroup for CPU barriers.")
+        .def("test_notify_dispatch", &deep_ep::Buffer::test_notify_dispatch,
+             py::arg("num_tokens_per_rank"),
+             py::arg("num_tokens_per_expert"),
+             py::arg("is_token_in_rank"),
+             py::arg("num_tokens"),
+             py::arg("num_experts"),
+             py::arg("num_channels"),
+             py::arg("expert_alignment"),
+             "Test notify_dispatch kernel directly. Returns (moe_recv_count, expert_counts, rank_prefix_matrix, channel_prefix_matrix).")
 #endif
         ;
 
@@ -2863,15 +2906,138 @@ void deep_ep::Buffer::test_ipc_read() {
               << ": IPC read test completed." << std::endl;
 }
 
-void deep_ep::Buffer::test_barrier() {
+void deep_ep::Buffer::test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group) {
     EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_barrier");
     std::cout << "[test_barrier] Rank " << nvl_rank << "/" << num_nvl_ranks 
               << ": Starting barrier test..." << std::endl;
     
+    // CPU barrier before GPU barrier
+    if (process_group.has_value()) {
+        std::cout << "[test_barrier] Rank " << nvl_rank << ": CPU barrier (before GPU)..." << std::endl;
+        auto work = process_group.value()->barrier();
+        work->wait();
+        std::cout << "[test_barrier] Rank " << nvl_rank << ": CPU barrier done." << std::endl;
+    }
+    
+    // GPU barrier
     intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
+    
+    // CPU barrier after GPU barrier
+    if (process_group.has_value()) {
+        std::cout << "[test_barrier] Rank " << nvl_rank << ": CPU barrier (after GPU)..." << std::endl;
+        auto work = process_group.value()->barrier();
+        work->wait();
+        std::cout << "[test_barrier] Rank " << nvl_rank << ": CPU barrier done." << std::endl;
+    }
     
     std::cout << "[test_barrier] Rank " << nvl_rank 
               << ": Barrier test completed." << std::endl;
+}
+
+std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> 
+deep_ep::Buffer::test_notify_dispatch(
+    const torch::Tensor& num_tokens_per_rank,
+    const torch::Tensor& num_tokens_per_expert,
+    const torch::Tensor& is_token_in_rank,
+    int num_tokens,
+    int num_experts,
+    int num_channels,
+    int expert_alignment) {
+    
+    EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_notify_dispatch");
+    
+    std::cout << "[test_notify_dispatch] Rank " << nvl_rank << "/" << num_nvl_ranks 
+              << ": Starting notify_dispatch test..." << std::endl;
+    std::cout << "[test_notify_dispatch] num_tokens=" << num_tokens 
+              << ", num_experts=" << num_experts 
+              << ", num_channels=" << num_channels << std::endl;
+    
+    // Validate inputs
+    EP_HOST_ASSERT(num_tokens_per_rank.dim() == 1 && num_tokens_per_rank.size(0) == num_nvl_ranks);
+    EP_HOST_ASSERT(num_tokens_per_expert.dim() == 1 && num_tokens_per_expert.size(0) == num_experts);
+    EP_HOST_ASSERT(is_token_in_rank.dim() == 2 && is_token_in_rank.size(0) == num_tokens && is_token_in_rank.size(1) == num_nvl_ranks);
+    
+    int num_local_experts = num_experts / num_nvl_ranks;
+    
+    // Allocate output tensors
+    auto rank_prefix_matrix = torch::empty({num_nvl_ranks, num_nvl_ranks}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto channel_prefix_matrix = torch::empty({num_nvl_ranks, num_channels}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    
+    // Reset counters
+    *moe_recv_counter = -1;
+    for (int i = 0; i < num_local_experts; ++i)
+        moe_recv_expert_counter[i] = -1;
+    
+    // Calculate memset size
+    int num_memset_int = num_channels * num_nvl_ranks * 4;
+    
+    std::cout << "[test_notify_dispatch] Rank " << nvl_rank 
+              << ": Launching notify_dispatch kernel..." << std::endl;
+    
+    // Call notify_dispatch kernel
+    intranode::notify_dispatch(
+        num_tokens_per_rank.data_ptr<int>(),
+        moe_recv_counter_mapped,
+        num_nvl_ranks,
+        num_tokens_per_expert.data_ptr<int>(),
+        moe_recv_expert_counter_mapped,
+        num_experts,
+        num_tokens,
+        is_token_in_rank.data_ptr<bool>(),
+        channel_prefix_matrix.data_ptr<int>(),
+        rank_prefix_matrix.data_ptr<int>(),
+        num_memset_int,
+        expert_alignment,
+        buffer_ptrs_gpu,
+        barrier_signal_ptrs_gpu,
+        nvl_rank,
+        comm_stream,
+        num_channels);
+    
+    std::cout << "[test_notify_dispatch] Rank " << nvl_rank 
+              << ": Kernel submitted, waiting for completion..." << std::endl;
+    
+    // Wait for completion
+    comm_stream.wait();
+    
+    std::cout << "[test_notify_dispatch] Rank " << nvl_rank 
+              << ": Kernel completed, reading results..." << std::endl;
+    
+    // Read results
+    int num_recv_tokens = -1;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    int max_wait_ms = 5000;  // 5 second timeout
+    
+    while (true) {
+        num_recv_tokens = static_cast<int>(*moe_recv_counter);
+        
+        bool ready = (num_recv_tokens >= 0);
+        for (int i = 0; i < num_local_experts && ready; ++i)
+            ready &= moe_recv_expert_counter[i] >= 0;
+        
+        if (ready) break;
+        
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - start_time).count();
+        if (elapsed > max_wait_ms) {
+            std::cout << "[test_notify_dispatch] Rank " << nvl_rank 
+                      << ": TIMEOUT waiting for results! moe_recv_counter=" << num_recv_tokens << std::endl;
+            break;
+        }
+    }
+    
+    std::vector<int> expert_counts(moe_recv_expert_counter, moe_recv_expert_counter + num_local_experts);
+    
+    std::cout << "[test_notify_dispatch] Rank " << nvl_rank 
+              << ": Results: moe_recv_count=" << num_recv_tokens 
+              << ", expert_counts=[";
+    for (int i = 0; i < num_local_experts; ++i) {
+        std::cout << expert_counts[i];
+        if (i < num_local_experts - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+    
+    return std::make_tuple(num_recv_tokens, expert_counts, rank_prefix_matrix, channel_prefix_matrix);
 }
 
 #endif // USE_XPU

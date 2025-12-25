@@ -99,7 +99,7 @@ public:
             }
 
             // 等待所有rank完成统计
-            barrier_block<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_cas<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
 
             auto local_per_rank_buffer = static_cast<int*>(buffer_ptrs_[rank_]);
             if (thread_id < kNumRanks) {
@@ -136,7 +136,7 @@ public:
                 local_per_expert_buffer[i] = 0;
 
             // 最终Barrier同步
-            barrier_block<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_cas<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
         } 
         else {
             // ===== Block 1-kNumRanks: Channel前缀和计算 =====
@@ -279,10 +279,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
     }
 
     #undef NOTIFY_DISPATCH_LAUNCH_CASE
-    
-    // 给 kernel 一点时间启动
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
     
     try {
         DEBUG_LOG(rank, "notify_dispatch: Calling stream.wait()...");

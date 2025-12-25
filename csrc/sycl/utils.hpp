@@ -267,21 +267,21 @@ SYCL_EXTERNAL inline void st_na_global(T* ptr, T value) {
 }
 
 // Device-only function: LSC uncached load
-// #ifdef __SYCL_DEVICE_ONLY__
-// inline int ld_volatile_global(const int* addr) {
-//     int result;
-//     asm volatile (
-//         "lsc_load.ugm.uc.uc (M1, 1) %0:d32 flat[%1]:a64"
-//         : "=rw"(result) : "rw"(addr)
-//     );
-//     return result;
-// }
-// #else
-// // todo: Host fallback 感觉应该添加一个runtime error
-// inline int ld_volatile_global(const int* addr) {
-//     return *addr;
-// }
-// #endif
+#ifdef __SYCL_DEVICE_ONLY__
+inline int ld_volatile_global(const int* addr) {
+    int result;
+    asm volatile (
+        "lsc_load.ugm.uc.uc (M1, 32) %0:d32 flat[%1]:a64"
+        : "=rw"(result) : "rw"(addr)
+    );
+    return result;
+}
+#else
+// todo: Host fallback 感觉应该添加一个runtime error
+inline int ld_volatile_global(const int* addr) {
+    return *addr;
+}
+#endif
 
 // 在 barrier_block 中，用 CAS-based load 验证
 SYCL_EXTERNAL inline int ld_volatile_global_cas(int* ptr) {
@@ -602,9 +602,9 @@ SYCL_EXTERNAL inline void barrier_verify_kernel(int** barrier_signal_ptrs, int r
 // ============================================================================
 
 // 使用 volatile 指针绕过缓存
-inline int ld_volatile_global(const int* addr) {
-    return *const_cast<volatile int*>(addr);
-}
+// inline int ld_volatile_global(const int* addr) {
+//     return *const_cast<volatile int*>(addr);
+// }
 
 
 
@@ -626,8 +626,7 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     //                  << "] sg_id=" << sg_id << ", lane_id=" << lane_id << sycl::endl;
     // }
     if (thread_id < kNumRanks) {
-        *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                     << "] sg_id=" << sg_id << ", lane_id=" << lane_id << sycl::endl;
+        *debug_stream << "[Rank " << rank << "][Thread " << thread_id << "]" << sycl::endl;
     }
     
     if constexpr (!kSyncOnly) {
@@ -638,7 +637,6 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     size_t add_spins = 0;
     size_t sub_spins = 0;
 
-    // if (sg_id < kNumRanks && lane_id == 0) {
     if (thread_id < kNumRanks) {
         // ========== Step 1: Put signal to self slot (0 -> rank * 1000 + thread_id) ==========
         int* self_ptr = barrier_signal_ptrs[rank] + thread_id;
@@ -647,13 +645,14 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
                          sycl::memory_scope::system> self_ref(*self_ptr);
 
         int add_tag = rank * 1000 + thread_id;
-        for (size_t i = 0; i < MAX_SPIN; ++i) {
-            int expected = 0;
-            if (self_ref.compare_exchange_strong(expected, add_tag)) {
-                break;
-            }
-            add_spins = i;
-        }
+        self_ref.store(add_tag, sycl::memory_order::acq_rel);
+        // for (size_t i = 0; i < MAX_SPIN; ++i) {
+        //     int expected = 0;
+        //     if (self_ref.store(add_tag, sycl::memory_order::release)) {
+        //         break;
+        //     }
+        //     add_spins = i;
+        // }
         
         if (debug_stream) {
             *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
@@ -662,11 +661,11 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
                          << ", spins=" << add_spins << sycl::endl;
         }
     }
-    
-    item.barrier(sycl::access::fence_space::global_space);
+    sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+    item.barrier(sycl::access::fence_space::local_space);
+    sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+    bool self_done = (thread_id < kNumRanks) ? false : true;  
 
-    bool self_done = (thread_id < kNumRanks && lane_id == 0) ? false : true;  
-  
     if (thread_id < kNumRanks) {
         // ========== Step 2: Wait signal from other slot (FINISHED_SUM_TAG -> 0) ==========
         int* other_ptr = barrier_signal_ptrs[thread_id] + rank;
@@ -674,10 +673,22 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
                          sycl::memory_order::acq_rel,
                          sycl::memory_scope::system> other_ref(*other_ptr);
         int sub_tag = thread_id * 1000 + rank;
-        for (size_t i = 0; i < MAX_SPIN; ++i) {
+        *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
+                     << "] other_ptr:" << ld_volatile_global(other_ptr) << sycl::endl;
+        for (size_t i = 0; ; ++i) {
+
+            if (i % 100000 == 0) {
+                sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+            }
+
             sub_tag = thread_id * 1000 + rank;
-            if (other_ref.compare_exchange_strong(sub_tag, 0)) {
+            if (other_ref.load(sycl::memory_order::acquire) == sub_tag) {
                 self_done = true;
+                *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
+                             << "] SUB_OTHER SUCCESS: [" << thread_id << "][" << rank 
+                             << "] " << sub_tag << " -> 0"
+                             << ", spins=" << i 
+                             << ", self_done=" << (self_done ? 1 : 0) << sycl::endl;
                 break;
             }
             sub_spins = i;
@@ -692,7 +703,7 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
         }
     }
 
-    item.barrier(sycl::access::fence_space::global_space);
+    item.barrier(sycl::access::fence_space::local_space);
     
     // ========== Step 3: Group all check - 所有线程都 done 才算成功 ==========
     bool all_done = sycl::all_of_group(item.get_group(), self_done);
