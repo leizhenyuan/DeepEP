@@ -98,6 +98,7 @@ __global__ void notify_dispatch(
 
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
+        
     } else {
         int dst_rank = sm_id - 1;
         // 每个warp 处理一个channel
@@ -263,6 +264,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
     auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[is_sender ? responsible_rank : rank]) +
                                        kNumRanks * kNumRanks * sizeof(int));
+    // target rank 表明数据的rank 来源
+    //
     int target_rank = is_sender ? rank : responsible_rank;
     auto num_channels_total = num_channels * kNumRanks;
     auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
@@ -781,7 +784,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
         const auto num_threads_per_rank = num_send_warps_per_rank * 32;
         const auto send_thread_id = thread_id;
         const auto send_warp_id = send_thread_id / 32;
-        // 这里的send rank id 为什么要偏移responsible channel？
+        // 发送到的目标rank的id
         const auto send_rank_id = (responsible_channel + send_warp_id) % kNumRanks;
         const auto send_warp_id_in_rank = send_warp_id / kNumRanks;
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
@@ -823,8 +826,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
+            // 检查target buffer 是否有足够的空间存放即将发送的数据
             if (elect_one_sync()) {
                 while (true) {
+                    // 由于不同的warp 负责的是不同的rank，所以这里需要让每个warp去检查slot是否有空位
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                     int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
                     if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
@@ -876,7 +881,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
         EP_DEVICE_ASSERT(thread_id >= 0 and kNumThreads % 32 == 0);
 
         // Shared head, tail and retired flags for receiver warps
-        // 消费者的 head idx，每个warp维护一份
+        // Warp w 在 Rank r 的 buffer 中消费到的位置
+        // 消费者的 head idx，每个warp维护一份，每个warp是copy的最小单位
+        // recv 阶段每个warp 居然要看到所有的rank，这个还挺意外的
         __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks];
         // 每个rank的 tail idx，由生产者决定所有warp 看到的应该是一致的，所以只需要kNumRanks个
         __shared__ volatile int channel_tail_idx[kNumRanks];
@@ -889,7 +896,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
         if (thread_id < kNumRanks)
             channel_tail_idx[thread_id] = 0;
         asm volatile("bar.sync 0, %0;" ::"r"(kNumThreads));
-
+        // warp0 作为scheduler，主要负责和sender 维护head/tail 指针的同步
         if (thread_id < 32) {
             // head_idx_ptr = channel * ranks
             int* channel_head_idx_ptr = static_cast<int*>(buffer_ptrs[rank]) + responsible_channel * kNumRanks + lane_id;
@@ -911,7 +918,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
                 channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
 
                 // Update minimum head
-                // 为什么要找到所有的reducer中最小的head，并更新到IPC buffer？
                 int min_head = std::numeric_limits<int>::max();
                 #pragma unroll
                 for (int i = 1; i < num_recv_warps; ++i)

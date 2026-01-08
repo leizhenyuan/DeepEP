@@ -4,17 +4,11 @@ Test DeepEP XPU notify_dispatch kernel directly.
 This test isolates the notify_dispatch kernel to debug barrier synchronization.
 
 Usage:
-    # Test the notify_dispatch kernel directly (simpler, faster)
-    python tests/test_xpu_notify_dispatch.py --num-processes 2 --test direct
-    
-    # Test through full dispatch path
-    python tests/test_xpu_notify_dispatch.py --num-processes 2 --test full
-    
-    # Test both
-    python tests/test_xpu_notify_dispatch.py --num-processes 2 --test all
+    # Test the notify_dispatch kernel directly
+    python tests/test_xpu_notify_dispatch.py --num-processes 2
     
     # Use MPI (recommended for xccl backend)
-    mpirun -np 2 python tests/test_xpu_notify_dispatch.py --use-mpi --test direct
+    mpirun -np 2 python tests/test_xpu_notify_dispatch.py --use-mpi
 """
 
 import argparse
@@ -244,20 +238,167 @@ def test_notify_dispatch_direct(rank: int, num_ranks: int, group, device: str, m
         print(f"  moe_recv_count: {moe_recv_count}", flush=True)
         print(f"  expert_counts: {expert_counts}", flush=True)
         
-        # Verify moe_recv_count
-        # This should equal the sum of tokens sent to this rank from all ranks
-        # In the single-machine case with local data, it should equal num_tokens_per_rank[rank]
-        expected_recv_count = num_tokens_per_rank[rank].item()
-        if moe_recv_count == expected_recv_count:
-            print(f"[Rank {rank}] moe_recv_count CORRECT! ({moe_recv_count} == {expected_recv_count})", flush=True)
-        else:
-            print(f"[Rank {rank}] moe_recv_count MISMATCH! (got {moe_recv_count}, expected {expected_recv_count})", flush=True)
+        # ========== 验证结果 ==========
+        all_passed = True
         
-        # Print matrices
+        # 1. 验证 moe_recv_count
+        # 需要收集所有 rank 的 num_tokens_per_rank，然后计算发送到本 rank 的总数
+        # 每个 rank 的 num_tokens_per_rank[i] 表示该 rank 发送给 rank i 的 token 数
+        # 所以本 rank 收到的总数 = sum(all_ranks_num_tokens_per_rank[:, rank])
+        
+        # 使用 MPI/dist 收集所有 rank 的 num_tokens_per_rank
+        all_num_tokens_per_rank = [torch.zeros_like(num_tokens_per_rank) for _ in range(num_ranks)]
+        dist.all_gather(all_num_tokens_per_rank, num_tokens_per_rank, group=group)
+        
+        # 计算本 rank 应该收到的 token 总数
+        expected_recv_count = sum(t[rank].item() for t in all_num_tokens_per_rank)
+        
+        if moe_recv_count == expected_recv_count:
+            print(f"[Rank {rank}] ✓ moe_recv_count CORRECT! ({moe_recv_count} == {expected_recv_count})", flush=True)
+        else:
+            print(f"[Rank {rank}] ✗ moe_recv_count MISMATCH! (got {moe_recv_count}, expected {expected_recv_count})", flush=True)
+            all_passed = False
+        
+        # 2. 验证 expert_counts
+        # expert_counts 应该等于本 rank 负责的 experts 收到的 token 数
+        experts_per_rank = num_experts // num_ranks
+        local_expert_start = rank * experts_per_rank
+        local_expert_end = local_expert_start + experts_per_rank
+        
+        # 收集所有 rank 的 num_tokens_per_expert
+        all_num_tokens_per_expert = [torch.zeros_like(num_tokens_per_expert) for _ in range(num_ranks)]
+        dist.all_gather(all_num_tokens_per_expert, num_tokens_per_expert, group=group)
+        
+        # 计算本 rank 的每个 local expert 应该收到的 token 数
+        expected_expert_counts = []
+        for e in range(local_expert_start, local_expert_end):
+            count = sum(t[e].item() for t in all_num_tokens_per_expert)
+            expected_expert_counts.append(count)
+        
+        if expert_counts == expected_expert_counts:
+            print(f"[Rank {rank}] ✓ expert_counts CORRECT! {expert_counts}", flush=True)
+        else:
+            print(f"[Rank {rank}] ✗ expert_counts MISMATCH!", flush=True)
+            print(f"    got:      {expert_counts}", flush=True)
+            print(f"    expected: {expected_expert_counts}", flush=True)
+            all_passed = False
+        
+        # 3. 验证 rank_prefix_matrix
+        # 关键理解：每个 rank 的 rank_prefix_matrix 只有列 rank 有有效数据！
+        # rank_prefix_matrix[i, rank] = 前 i+1 个 rank 发送给本 rank 的 token 数的前缀和
+        print(f"[Rank {rank}] rank_prefix_matrix shape: {rank_prefix_matrix.shape}", flush=True)
         print(f"[Rank {rank}] rank_prefix_matrix:", flush=True)
         print(rank_prefix_matrix.cpu(), flush=True)
-        print(f"[Rank {rank}] channel_prefix_matrix:", flush=True)
-        print(channel_prefix_matrix.cpu(), flush=True)
+        
+        rank_prefix_cpu = rank_prefix_matrix.cpu()
+        col = rank  # 只有列 rank 有有效数据
+        
+        # 计算期望的前缀和
+        prefix_sum = 0
+        for i in range(num_ranks):
+            # 期望值：前 i+1 个 rank 发给本 rank 的 token 数的前缀和
+            prefix_sum += all_num_tokens_per_rank[i][rank].item()
+            actual_val = rank_prefix_cpu[i, col].item()
+            
+            if actual_val != prefix_sum:
+                print(f"[Rank {rank}] ✗ rank_prefix_matrix[{i}, {col}] mismatch: "
+                      f"got {actual_val}, expected {prefix_sum}", flush=True)
+                all_passed = False
+            else:
+                print(f"[Rank {rank}] ✓ rank_prefix_matrix[{i}, {col}] = {actual_val} (correct)", flush=True)
+        
+        # 最后一行的值应该等于 moe_recv_count
+        last_row_val = rank_prefix_cpu[num_ranks - 1, col].item()
+        if last_row_val != expected_recv_count:
+            print(f"[Rank {rank}] ✗ rank_prefix_matrix last row mismatch: "
+                  f"got {last_row_val}, expected {expected_recv_count}", flush=True)
+            all_passed = False
+        else:
+            print(f"[Rank {rank}] ✓ rank_prefix_matrix last row = moe_recv_count = {last_row_val}", flush=True)
+        
+        # 4. 验证 channel_prefix_matrix
+        # channel_prefix_matrix[dst_rank, channel] = 前 channel+1 个 channel 中发往 dst_rank 的 token 数的前缀和
+        # 这个矩阵是本 rank 本地计算的，不涉及跨 rank 通信
+        # print(f"[Rank {rank}] channel_prefix_matrix shape: {channel_prefix_matrix.shape}", flush=True)
+        # print(f"[Rank {rank}] channel_prefix_matrix:", flush=True)
+        # print(channel_prefix_matrix.cpu(), flush=True)
+        
+        channel_prefix_cpu = channel_prefix_matrix.cpu()
+        
+        # 计算期望的 channel_prefix_matrix
+        # 首先计算每个 channel 中发往各 rank 的 token 数
+        def get_channel_task_range(num_tokens, num_channels, channel_id):
+            """计算 channel 的 token 范围（与 kernel 中的逻辑一致）"""
+            tokens_per_channel = num_tokens // num_channels
+            remainder = num_tokens % num_channels
+            if channel_id < remainder:
+                start = channel_id * (tokens_per_channel + 1)
+                end = start + tokens_per_channel + 1
+            else:
+                start = remainder * (tokens_per_channel + 1) + (channel_id - remainder) * tokens_per_channel
+                end = start + tokens_per_channel
+            return start, end
+        
+        # 计算每个 (dst_rank, channel) 的 token 数
+        channel_counts = torch.zeros(num_ranks, num_channels, dtype=torch.int32)
+        is_token_in_rank_cpu = is_token_in_rank.cpu()
+        
+        for dst_rank in range(num_ranks):
+            for channel_id in range(num_channels):
+                token_start, token_end = get_channel_task_range(num_tokens, num_channels, channel_id)
+                count = 0
+                for token_idx in range(token_start, token_end):
+                    if is_token_in_rank_cpu[token_idx, dst_rank]:
+                        count += 1
+                channel_counts[dst_rank, channel_id] = count
+        
+        # 计算前缀和
+        expected_channel_prefix = torch.zeros(num_ranks, num_channels, dtype=torch.int32)
+        for dst_rank in range(num_ranks):
+            prefix_sum = 0
+            for channel_id in range(num_channels):
+                prefix_sum += channel_counts[dst_rank, channel_id].item()
+                expected_channel_prefix[dst_rank, channel_id] = prefix_sum
+        
+        # 验证
+        channel_prefix_match = True
+        for dst_rank in range(num_ranks):
+            for channel_id in range(num_channels):
+                actual = channel_prefix_cpu[dst_rank, channel_id].item()
+                expected = expected_channel_prefix[dst_rank, channel_id].item()
+                if actual != expected:
+                    print(f"[Rank {rank}] ✗ channel_prefix_matrix[{dst_rank}, {channel_id}] mismatch: "
+                          f"got {actual}, expected {expected}", flush=True)
+                    channel_prefix_match = False
+                    all_passed = False
+        
+        if channel_prefix_match:
+            print(f"[Rank {rank}] ✓ channel_prefix_matrix CORRECT!", flush=True)
+        
+        # 额外检查：每行的最后一个值应该等于发往该 rank 的 token 总数
+        for dst_rank in range(num_ranks):
+            last_channel_val = channel_prefix_cpu[dst_rank, num_channels - 1].item()
+            expected_total = num_tokens_per_rank[dst_rank].item()
+            if last_channel_val != expected_total:
+                print(f"[Rank {rank}] ✗ channel_prefix_matrix[{dst_rank}] last value mismatch: "
+                      f"got {last_channel_val}, expected {expected_total}", flush=True)
+                all_passed = False
+            else:
+                print(f"[Rank {rank}] ✓ channel_prefix_matrix[{dst_rank}] last value = {last_channel_val} "
+                      f"(matches num_tokens_per_rank[{dst_rank}])", flush=True)
+        
+        # 5. 总结
+        if all_passed:
+            print(f"[Rank {rank}] ✓ All checks PASSED!", flush=True)
+        else:
+            print(f"[Rank {rank}] ✗ Some checks FAILED!", flush=True)
+            # 打印详细信息帮助调试
+            print(f"\n[Rank {rank}] Debug info:", flush=True)
+            print(f"  all_num_tokens_per_rank:", flush=True)
+            for r, t in enumerate(all_num_tokens_per_rank):
+                print(f"    Rank {r}: {t.tolist()}", flush=True)
+            print(f"  expected_channel_prefix:", flush=True)
+            print(expected_channel_prefix, flush=True)
         
     except Exception as e:
         print(f"[Rank {rank}] ERROR during test_notify_dispatch: {e}", flush=True)
@@ -276,149 +417,6 @@ def test_notify_dispatch_direct(rank: int, num_ranks: int, group, device: str, m
     cpu_barrier()
 
 
-def test_notify_dispatch_full(rank: int, num_ranks: int, group, device, mpi_comm, args):
-    """Test notify_dispatch kernel through full dispatch path"""
-    import deep_ep
-    
-    # Set up cpu_barrier based on whether we have MPI
-    if mpi_comm is not None:
-        def cpu_barrier():
-            mpi_comm.Barrier()
-    else:
-        def cpu_barrier():
-            dist.barrier()
-    
-    if rank == 0:
-        print("\n[Setup] Creating DeepEP Buffer...", flush=True)
-    
-    buffer = deep_ep.Buffer(
-        group,
-        int(2e8),  # 200MB NVL buffer
-        num_rdma_bytes=0,
-        low_latency_mode=False,
-        num_qps_per_rank=1,
-        explicitly_destroy=True
-    )
-    
-    if rank == 0:
-        print(f"[Setup] Buffer created: rank={buffer.rank}, num_ranks={buffer.group_size}", flush=True)
-    
-    cpu_barrier()
-    
-    # ========== Test Parameters ==========
-    num_tokens = args.num_tokens
-    hidden = 512
-    num_experts = args.num_experts
-    num_topk = 4
-    
-    if rank == 0:
-        print(f"\n[Test Full] Parameters:", flush=True)
-        print(f"  num_tokens={num_tokens}", flush=True)
-        print(f"  hidden={hidden}", flush=True)
-        print(f"  num_experts={num_experts}", flush=True)
-        print(f"  num_topk={num_topk}", flush=True)
-        print(f"  num_ranks={num_ranks}", flush=True)
-    
-    # ========== Prepare Input Data ==========
-    # Create input tensor
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device=device) * rank
-    
-    # Create topk_idx
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=device).abs() + 1
-    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
-    topk_idx = topk_idx.to(deep_ep.topk_idx_t)
-    
-    # Create topk_weights
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device=device) * rank
-    
-    torch.xpu.synchronize()
-    cpu_barrier()
-    
-    if rank == 0:
-        print(f"\n[Test] Input data prepared", flush=True)
-        print(f"  x.shape={x.shape}, x.dtype={x.dtype}", flush=True)
-        print(f"  topk_idx.shape={topk_idx.shape}, topk_idx.dtype={topk_idx.dtype}", flush=True)
-    
-    # ========== Get Dispatch Layout ==========
-    if rank == 0:
-        print(f"\n[Test] Getting dispatch layout...", flush=True)
-    
-    num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = \
-        buffer.get_dispatch_layout(topk_idx, num_experts)
-    
-    torch.xpu.synchronize()
-    cpu_barrier()
-    
-    if rank == 0:
-        print(f"[Test] Layout obtained:", flush=True)
-        print(f"  num_tokens_per_rank={num_tokens_per_rank.tolist()}", flush=True)
-        print(f"  num_tokens_per_expert.shape={num_tokens_per_expert.shape}", flush=True)
-        print(f"  is_token_in_rank.shape={is_token_in_rank.shape}", flush=True)
-    
-    # ========== Test Dispatch (THIS IS WHERE IT HANGS) ==========
-    if rank == 0:
-        print(f"\n[Test] About to call buffer.dispatch()...", flush=True)
-        print(f"[Test] This will trigger notify_dispatch kernel", flush=True)
-    
-    cpu_barrier()
-    
-    # Set number of SMs
-    num_sms = 24
-    deep_ep.Buffer.set_num_sms(num_sms)
-    config = deep_ep.Buffer.get_dispatch_config(num_ranks)
-    
-    if rank == 0:
-        print(f"[Test Full] Config: num_sms={num_sms}, config={config}", flush=True)
-    
-    try:
-        print(f"[Rank {rank}] Calling dispatch... (should see C++ debug logs)", flush=True)
-        start_time = time.time()
-        
-        recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
-            buffer.dispatch(
-                x=x,
-                num_tokens_per_rank=num_tokens_per_rank,
-                is_token_in_rank=is_token_in_rank,
-                num_tokens_per_expert=num_tokens_per_expert,
-                topk_idx=topk_idx,
-                topk_weights=topk_weights,
-                config=config,
-                async_finish=False
-            )
-        
-        elapsed = time.time() - start_time
-        print(f"[Rank {rank}] Dispatch completed in {elapsed*1000:.2f} ms!", flush=True)
-        
-        # Verify results
-        print(f"[Rank {rank}] Results:", flush=True)
-        print(f"  recv_x.shape={recv_x.shape}", flush=True)
-        print(f"  recv_topk_idx.shape={recv_topk_idx.shape if recv_topk_idx is not None else None}", flush=True)
-        
-    except Exception as e:
-        print(f"[Rank {rank}] ERROR during dispatch: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        raise
-    
-    torch.xpu.synchronize()
-    cpu_barrier()
-    
-    if rank == 0:
-        print(f"\n[Test Full] Dispatch test PASSED!", flush=True)
-    
-    # ========== Cleanup ==========
-    if rank == 0:
-        print("\n[Cleanup] Destroying buffer...", flush=True)
-    
-    buffer.destroy()
-    cpu_barrier()
-    
-    if rank == 0:
-        print("\n" + "=" * 50, flush=True)
-        print("notify_dispatch full test completed successfully!", flush=True)
-        print("=" * 50, flush=True)
-
-
 def worker_fn(local_rank: int, num_ranks: int, args):
     """Worker function for multiprocessing (mp.spawn mode)"""
     # Add parent directory to sys.path so subprocess can import deep_ep
@@ -431,19 +429,7 @@ def worker_fn(local_rank: int, num_ranks: int, args):
     rank, world_size, group, device = init_dist_spawn(local_rank, num_ranks, args.port)
     mpi_comm = None  # No MPI in mp.spawn mode
     
-    test_type = args.test
-    
-    if test_type == 'direct' or test_type == 'all':
-        test_notify_dispatch_direct(rank, world_size, group, device, mpi_comm, args)
-        
-        # If running 'all', need to reinit dist after first test
-        if test_type == 'all' and rank == 0:
-            print("\n" + "=" * 60, flush=True)
-            print("Direct test completed, starting full test...", flush=True)
-            print("=" * 60 + "\n", flush=True)
-    
-    if test_type == 'full':
-        test_notify_dispatch_full(rank, world_size, group, device, mpi_comm, args)
+    test_notify_dispatch_direct(rank, world_size, group, device, mpi_comm, args)
     
     # Cleanup
     dist.destroy_process_group()
@@ -459,25 +445,14 @@ def main_mpi(args):
     # Initialize via MPI
     rank, world_size, group, device, mpi_comm = init_dist_mpi(args.port, use_gloo=args.use_gloo)
     
-    test_type = args.test
-    
-    if test_type == 'direct' or test_type == 'all':
-        test_notify_dispatch_direct(rank, world_size, group, device, mpi_comm, args)
-        
-        if test_type == 'all' and rank == 0:
-            print("\n" + "=" * 60, flush=True)
-            print("Direct test completed, starting full test...", flush=True)
-            print("=" * 60 + "\n", flush=True)
-    
-    if test_type == 'full':
-        test_notify_dispatch_full(rank, world_size, group, device, mpi_comm, args)
+    test_notify_dispatch_direct(rank, world_size, group, device, mpi_comm, args)
     
     # Cleanup
     dist.destroy_process_group()
     
     if rank == 0:
         print("\n" + "=" * 50, flush=True)
-        print("All tests completed!", flush=True)
+        print("Test completed!", flush=True)
         print("=" * 50, flush=True)
 
 
@@ -493,9 +468,6 @@ def main():
                         help='Number of channels (default: 4)')
     parser.add_argument('--expert-alignment', type=int, default=1,
                         help='Expert alignment (default: 1)')
-    parser.add_argument('--test', type=str, default='direct',
-                        choices=['direct', 'full', 'all'],
-                        help='Which test to run: direct (new API), full (dispatch path), all')
     parser.add_argument('--port', type=int, default=29556,
                         help='Master port for distributed communication (default: 29556)')
     parser.add_argument('--use-mpi', action='store_true',
@@ -524,7 +496,6 @@ def main():
         if rank == 0:
             print("=" * 60, flush=True)
             print(f"DeepEP XPU notify_dispatch Test ({world_size} GPUs, MPI mode)", flush=True)
-            print(f"Test mode: {args.test}", flush=True)
             print(f"Backend: {'gloo' if args.use_gloo else 'xccl'}", flush=True)
             print(f"num_tokens={args.num_tokens}, num_experts={args.num_experts}", flush=True)
             print(f"num_channels={args.num_channels}, expert_alignment={args.expert_alignment}", flush=True)
@@ -537,7 +508,6 @@ def main():
         
         print("=" * 60, flush=True)
         print(f"DeepEP XPU notify_dispatch Test ({num_processes} GPUs)", flush=True)
-        print(f"Test mode: {args.test}", flush=True)
         print(f"num_tokens={args.num_tokens}, num_experts={args.num_experts}", flush=True)
         print(f"num_channels={args.num_channels}, expert_alignment={args.expert_alignment}", flush=True)
         print("=" * 60, flush=True)

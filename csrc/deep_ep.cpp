@@ -913,7 +913,23 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    rank,
                                    comm_stream,
                                    num_channels);
-
+        
+        // Debug: print rank_prefix_matrix
+        // CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+        if (rank == 0) {
+            std::cout << "[Rank " << rank << "] rank_prefix_matrix after notify_dispatch:" << std::endl;
+            auto rank_prefix_cpu = rank_prefix_matrix.cpu();
+            auto* data = rank_prefix_cpu.data_ptr<int>();
+            for (int i = 0; i < num_ranks; ++i) {
+                std::cout << "  row " << i << ": [";
+                for (int j = 0; j < num_ranks; ++j) {
+                    std::cout << data[i * num_ranks + j];
+                    if (j < num_ranks - 1) std::cout << ", ";
+                }
+                std::cout << "]" << std::endl;
+            }
+        }
+        
         if (num_worst_tokens > 0) {
             // No CPU sync, just allocate the worst case
             num_recv_tokens = num_worst_tokens;
@@ -2424,6 +2440,20 @@ deep_ep::Buffer::intranode_dispatch(const torch::Tensor& x,
                                    rank,
                                    comm_stream,
                                    num_channels);
+        if (rank == 0) {
+            std::cout << "[Rank " << rank << "] rank_prefix_matrix after notify_dispatch:" << std::endl;
+        auto rank_prefix_cpu = rank_prefix_matrix.cpu();
+        auto* data = rank_prefix_cpu.data_ptr<int>();
+        for (int i = 0; i < num_ranks; ++i) {
+            std::cout << "  row " << i << ": [";
+            for (int j = 0; j < num_ranks; ++j) {
+                std::cout << data[i * num_ranks + j];
+                if (j < num_ranks - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+        }
+        }
+
         std::cout << "[XPU] notify_dispatch done." << std::endl;
 
         // Synchronize to ensure kernel completes
@@ -2993,7 +3023,19 @@ deep_ep::Buffer::test_notify_dispatch(
         nvl_rank,
         comm_stream,
         num_channels);
-    
+    if (rank == 0) {
+        std::cout << "[Rank " << rank << "] rank_prefix_matrix after notify_dispatch:" << std::endl;
+        auto rank_prefix_cpu = rank_prefix_matrix.cpu();
+        auto* data = rank_prefix_cpu.data_ptr<int>();
+        for (int i = 0; i < num_ranks; ++i) {
+            std::cout << "  row " << i << ": [";
+            for (int j = 0; j < num_ranks; ++j) {
+                std::cout << data[i * num_ranks + j];
+                if (j < num_ranks - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+        }
+    }
     std::cout << "[test_notify_dispatch] Rank " << nvl_rank 
               << ": Kernel submitted, waiting for completion..." << std::endl;
     
