@@ -533,21 +533,6 @@ public:
         const auto responsible_rank = thread_id / num_threads_per_rank;
         const auto responsible_channel = sm_id / 2;
 
-        // DEBUG: Print entry info (only thread 0 of each SM)
-        if (thread_id == 0) {
-            debug_stream_ << "[DispatchKernel] rank=" << rank_ << " sm_id=" << sm_id 
-                         << " is_sender=" << is_sender << " responsible_channel=" << responsible_channel
-                         << " num_tokens=" << num_tokens_ << sycl::endl;
-        }
-
-        // ========== DEBUG MODE: 注释掉大部分代码，逐步解除注释来调试 ==========
-        // 第一步：先让kernel能跑完，不做任何实际工作
-        // 解除注释的顺序建议：
-        //   1. 先解除 buffer setup 部分
-        //   2. 再解除 dispatch_sender 中写 offset 的部分
-        //   3. 再解除 dispatch_receiver 中读 offset 的部分
-        //   4. 最后解除数据传输循环
-
         int num_experts_per_rank = num_experts_ / kNumRanks;
 
         // Calculate pointers by the specific layout
@@ -582,31 +567,15 @@ public:
             static_cast<int64_t>(channel_rank_offset) * num_recv_buffer_tokens_ * num_scales_);
 
         if (is_sender) {
-            if (thread_id == 0) {
-                debug_stream_ << "[DispatchKernel] rank=" << rank_ << " sm_id=" << sm_id 
-                             << " ENTERING dispatch_sender" << sycl::endl;
-            }
             dispatch_sender(item, num_threads_per_rank, num_channels, responsible_rank, responsible_channel,
                            num_experts_per_rank, channel_start_offset, channel_end_offset, channel_head_idx,
                            channel_tail_idx, channel_x_buffers, channel_src_idx_buffers, channel_topk_idx_buffers,
                            channel_topk_weights_buffers, channel_x_scales_buffers);
-            if (thread_id == 0) {
-                debug_stream_ << "[DispatchKernel] rank=" << rank_ << " sm_id=" << sm_id 
-                             << " EXITED dispatch_sender" << sycl::endl;
-            }
         } else {
-            if (thread_id == 0) {
-                debug_stream_ << "[DispatchKernel] rank=" << rank_ << " sm_id=" << sm_id 
-                             << " ENTERING dispatch_receiver" << sycl::endl;
-            }
             dispatch_receiver(item, num_threads_per_rank, num_channels, responsible_rank, responsible_channel,
                              channel_start_offset, channel_end_offset, channel_head_idx, channel_tail_idx,
                              channel_x_buffers, channel_src_idx_buffers, channel_topk_idx_buffers,
                              channel_topk_weights_buffers, channel_x_scales_buffers);
-            if (thread_id == 0) {
-                debug_stream_ << "[DispatchKernel] rank=" << rank_ << " sm_id=" << sm_id 
-                             << " EXITED dispatch_receiver" << sycl::endl;
-            }
         }
 
 
@@ -622,12 +591,6 @@ public:
                 recv_topk_idx_[i] = -1;
         }
         ==================== END STEP 3 ==================== */
-
-        // DEBUG: Final exit
-        if (thread_id == 0) {
-            debug_stream_ << "[DispatchKernel] rank=" << rank_ << " sm_id=" << sm_id 
-                         << " KERNEL COMPLETED" << sycl::endl;
-        }
     }
 
 private:
@@ -656,12 +619,6 @@ private:
         const auto send_thread_id = thread_id;
         const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
 
-        // DEBUG: Print sender entry info
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_sender] rank=" << rank_ << " resp_rank=" << responsible_rank 
-                         << " resp_channel=" << responsible_channel << sycl::endl;
-        }
-
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
         if (send_warp_id_in_rank == 0 && elect_one_sync(item)) {
@@ -682,11 +639,6 @@ private:
 
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_tokens_, num_channels, responsible_channel, token_start_idx, token_end_idx);
-        
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_sender] rank=" << rank_ << " token_range=[" << token_start_idx 
-                         << "," << token_end_idx << ")" << sycl::endl;
-        }
 
         int cached_channel_tail_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
@@ -698,8 +650,6 @@ private:
                     head_idx_value = ld_volatile_global(channel_head_idx.buffer());
                     int num_used_slots = cached_channel_tail_idx - head_idx_value;
                     if (num_recv_buffer_tokens_ - num_used_slots >= num_max_send_tokens_) {
-                        debug_stream_ << "[dispatch_sender] rank=" << rank_ << " ld_volatile_global(head_idx) SUCCESS: head_idx="
-                                     << head_idx_value << " slots_available=" << (num_recv_buffer_tokens_ - num_used_slots) << sycl::endl;
                         break;
                     }
                     loop_count++;
@@ -770,12 +720,6 @@ private:
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
             }
         }
-        
-        // DEBUG: Print sender completion
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_sender] rank=" << rank_ << " resp_rank=" << responsible_rank 
-                         << " SENDER COMPLETED" << sycl::endl;
-        }
     }
 
     void dispatch_receiver(
@@ -803,18 +747,9 @@ private:
         const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
 
-        // DEBUG: Print receiver entry info
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " resp_rank=" << responsible_rank 
-                         << " resp_channel=" << responsible_channel << sycl::endl;
-        }
-
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs_[rank_]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank_] : 0;
-        
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " rank_offset=" << rank_offset << sycl::endl;
-        }
+    
 
         int total_offset = 0, num_tokens_to_recv = 0;
         if (elect_one_sync(item)) {
@@ -826,9 +761,7 @@ private:
                     break;
                 }
             }
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " ld_volatile_global(start_offset) SUCCESS: raw=" 
-                         << total_offset << " from addr=" << (void*)channel_start_offset.buffer() << sycl::endl;
-            
+
             loop_count = 0;
             while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0) {
                 loop_count++;
@@ -837,14 +770,9 @@ private:
                     break;
                 }
             }
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " ld_volatile_global(end_offset) SUCCESS: raw=" 
-                         << num_tokens_to_recv << " from addr=" << (void*)channel_end_offset.buffer() << sycl::endl;
             total_offset = -total_offset - 1;
             num_tokens_to_recv = -num_tokens_to_recv - 1;
-            
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " received offset=" << total_offset 
-                         << " num_tokens=" << num_tokens_to_recv << sycl::endl;
-            
+
             if (recv_warp_id_in_rank == 0)
                 recv_channel_offset_[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
@@ -855,11 +783,6 @@ private:
 
         // ==================== RECEIVER STEP C: 数据接收循环 ====================
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
-        
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " will receive " << num_tokens_to_recv 
-                         << " tokens, total_offset=" << total_offset << sycl::endl;
-        }
         
         while (num_tokens_to_recv > 0) {
             // Wait for new data - only the leader of each sub_group polls
@@ -937,17 +860,10 @@ private:
             // Only the last warp's leader updates head_idx
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 && elect_one_sync(item)) {
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
-                debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " updated head_idx=" << cached_channel_head_idx << sycl::endl;
+                // debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " updated head_idx=" << cached_channel_head_idx << sycl::endl;
             }
 
             num_tokens_to_recv -= num_recv_tokens;
-        }
-        // ==================== END RECEIVER STEP C ====================
-        
-        // DEBUG: Print receiver completion
-        if (thread_id == 0) {
-            debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " resp_rank=" << responsible_rank 
-                         << " RECEIVER COMPLETED" << sycl::endl;
         }
     }
 
@@ -1244,15 +1160,6 @@ void cached_notify_combine(void** buffer_ptrs,
     stream.wait();
     DEBUG_LOG(rank, "cached_notify_combine: COMPLETED");
 }
-
-// ============================================================================
-// combine kernel - SYCL版本 (Stub)
-// ============================================================================
-// CombineKernel - SYCL版本
-// 偶数sm为sender (将local expert输出发送到各rank的buffer)
-// 奇数sm为receiver (从buffer中读取数据并进行reduce)
-// ============================================================================
-
 template <typename dtype_t, int kNumRanks, int kNumThreads>
 class CombineKernel {
 public:
@@ -1413,6 +1320,24 @@ private:
                     st_na_global(shifted_x_buffers + j, ld_nc_global(shifted_x + j));
                 }
                 
+                // 调试日志：打印发送信息
+                if (lane_id == 0 && debug_stream_ != nullptr) {
+                    auto sm_id = static_cast<int>(item.get_group(0));
+                    // 读取 embedding[0] 的数据 (第一个 int4，包含多个 dtype_t 元素)
+                    int4 first_int4 = ld_nc_global(shifted_x);
+                    auto first_values = reinterpret_cast<const dtype_t*>(&first_int4);
+                    *debug_stream_ << "[COMBINE_SENDER] Rank " << rank_ 
+                                   << ", SM " << sm_id 
+                                   << ", Channel " << responsible_channel
+                                   << ", Warp " << send_warp_id
+                                   << " -> DestRank " << send_rank_id
+                                   << ": Token " << (token_idx + i) 
+                                   << " -> Slot " << dst_slot_idx
+                                   << ", src_idx=" << src_idx_[token_idx + i]
+                                   << ", embed[0]=" << static_cast<float>(first_values[0])
+                                   << sycl::endl;
+                }
+                
                 // 发送src_idx
                 if (elect_one_sync(item)) {
                     channel_src_idx_buffers[dst_slot_idx] = src_idx_[token_idx + i];
@@ -1428,9 +1353,9 @@ private:
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
             
-            // 同步本rank的所有warp (使用sub_group barrier模拟)
-            // 在SYCL中用group barrier代替
-            item.barrier(sycl::access::fence_space::global_space);
+            // warning:这里可能是一个risk，应该是所有相同send rank id的warp进行同步
+            // 可能会出现其他warp没写完，但是warp0 issue了tail，还要再想想，不行的话就减少warp，每个kernel send = rank数
+            item.get_sub_group().barrier();
             
             // 更新tail索引 (只有第一个warp的leader执行)
             if (send_warp_id_in_rank == 0 && elect_one_sync(item)) {
@@ -1440,7 +1365,7 @@ private:
     }
     
     // Receiver: 从buffer中读取数据并进行reduce
-    void combine_receiver(
+    SYCL_EXTERNAL void combine_receiver(
         sycl::nd_item<1> item,
         int num_channels,
         int responsible_channel,
@@ -1588,6 +1513,32 @@ private:
                     }
                 }
                 
+                // 调试日志：打印接收信息（只有lane 0打印）
+                if (lane_id == 0 && debug_stream_ != nullptr) {
+                    auto sm_id = static_cast<int>(item.get_group(0));
+                    *debug_stream_ << "[COMBINE_RECEIVER] Rank " << rank_ 
+                                   << ", SM " << sm_id 
+                                   << ", Channel " << responsible_channel
+                                   << ", Warp " << recv_warp_id
+                                   << ": OutputToken " << token_idx 
+                                   << ", num_sources=" << num_topk_ranks
+                                   << sycl::endl;
+                    
+                    // 打印每个来源的详细信息
+                    for (int src = 0; src < num_topk_ranks; ++src) {
+                        int src_rank = topk_ranks[src];
+                        int src_slot = slot_indices[src];
+                        // 读取该来源的embedding[0]
+                        int4 src_first_int4 = ld_nc_global(
+                            channel_x_buffers[src_rank].buffer() + src_slot * hidden_int4);
+                        auto src_first_values = reinterpret_cast<const dtype_t*>(&src_first_int4);
+                        *debug_stream_ << "    Source[" << src << "]: FromRank " << src_rank
+                                       << ", Slot " << src_slot
+                                       << ", embed[0]=" << static_cast<float>(src_first_values[0])
+                                       << sycl::endl;
+                    }
+                }
+                
                 // Reduce数据
                 for (int i = lane_id; i < hidden_int4; i += 32) {
                     // 读取bias
@@ -1631,6 +1582,18 @@ private:
                     
                     // 写入结果
                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
+                    
+                    // 调试日志：打印输出结果的embedding[0]（只有处理第一个int4的lane打印）
+                    if (i == 0 && debug_stream_ != nullptr) {
+                        auto sm_id = static_cast<int>(item.get_group(0));
+                        *debug_stream_ << "[COMBINE_RECEIVER_OUT] Rank " << rank_ 
+                                       << ", SM " << sm_id 
+                                       << ", Channel " << responsible_channel
+                                       << ", Warp " << recv_warp_id
+                                       << ": OutputToken " << token_idx 
+                                       << ", output_embed[0]=" << static_cast<float>(out_dtypes[0])
+                                       << sycl::endl;
+                    }
                 }
                 
                 // Reduce topk_weights
@@ -1681,8 +1644,6 @@ private:
     int num_recv_buffer_tokens_;
     const sycl::stream* debug_stream_;
 };
-
-// ============================================================================
 
 void combine(std::nullptr_t type,
              void* recv_x,
@@ -1739,13 +1700,13 @@ void combine(std::nullptr_t type,
                 cgh.parallel_for(                                                          \
                     sycl::nd_range<1>(global_range, local_range),                         \
                     [=](sycl::nd_item<1> item) {                                          \
-                        CombineKernel<sycl::half, ranks, kNumThreads> kernel(              \
-                            reinterpret_cast<sycl::half*>(recv_x),                        \
+                        CombineKernel<sycl::ext::oneapi::bfloat16, ranks, kNumThreads> kernel( \
+                            reinterpret_cast<sycl::ext::oneapi::bfloat16*>(recv_x),       \
                             recv_topk_weights,                                             \
-                            reinterpret_cast<const sycl::half*>(x),                       \
+                            reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(x),      \
                             topk_weights,                                                  \
-                            reinterpret_cast<const sycl::half*>(bias_0),                  \
-                            reinterpret_cast<const sycl::half*>(bias_1),                  \
+                            reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(bias_0), \
+                            reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(bias_1), \
                             src_idx,                                                       \
                             rank_prefix_matrix,                                            \
                             channel_prefix_matrix,                                         \

@@ -2588,9 +2588,104 @@ deep_ep::Buffer::intranode_combine(const torch::Tensor& x,
                                   std::optional<deep_ep::EventHandle>& previous_event,
                                   bool async,
                                   bool allocate_on_comm_stream) {
-    // XPU stub - TODO: implement XPU intranode combine
-    auto dummy_tensor = torch::empty_like(x);
-    return std::make_tuple(dummy_tensor, std::nullopt, std::nullopt);
+    // Validate input tensors
+    EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
+    EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(rank_prefix_matrix.dim() == 2 and rank_prefix_matrix.is_contiguous() and
+                   rank_prefix_matrix.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(channel_prefix_matrix.dim() == 2 and channel_prefix_matrix.is_contiguous() and
+                   channel_prefix_matrix.scalar_type() == torch::kInt32);
+
+    // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
+    EP_HOST_ASSERT(config.num_sms % 2 == 0);
+    int num_channels = config.num_sms / 2;
+
+    auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
+    auto num_recv_tokens = static_cast<int>(send_head.size(0));  // Original token count
+    EP_HOST_ASSERT(src_idx.size(0) == num_tokens);
+    EP_HOST_ASSERT(send_head.size(1) == num_ranks);
+    EP_HOST_ASSERT(rank_prefix_matrix.size(0) == num_ranks and rank_prefix_matrix.size(1) == num_ranks);
+    EP_HOST_ASSERT(channel_prefix_matrix.size(0) == num_ranks and channel_prefix_matrix.size(1) == num_channels);
+    EP_HOST_ASSERT((hidden * x.element_size()) % sizeof(int4) == 0);
+
+    // Handle topk weights
+    int num_topk = 0;
+    auto recv_topk_weights = std::optional<torch::Tensor>();
+    float* topk_weights_ptr = nullptr;
+    float* recv_topk_weights_ptr = nullptr;
+    if (topk_weights.has_value()) {
+        EP_HOST_ASSERT(topk_weights->dim() == 2 and topk_weights->is_contiguous());
+        EP_HOST_ASSERT(topk_weights->size(0) == num_tokens);
+        EP_HOST_ASSERT(topk_weights->scalar_type() == torch::kFloat32);
+        num_topk = static_cast<int>(topk_weights->size(1));
+        topk_weights_ptr = topk_weights->data_ptr<float>();
+        recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
+        recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
+    }
+
+    // Launch barrier and reset queue head and tail
+    EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 <= num_nvl_bytes);
+    intranode::cached_notify_combine(buffer_ptrs_gpu,
+                                     send_head.data_ptr<int>(),
+                                     num_channels,
+                                     num_recv_tokens,
+                                     num_channels * num_ranks * 2,
+                                     barrier_signal_ptrs_gpu,
+                                     rank,
+                                     num_ranks,
+                                     comm_stream);
+
+    // Assign bias pointers
+    auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
+    void* bias_ptrs[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i)
+        if (bias_opts[i].has_value()) {
+            auto bias = bias_opts[i].value();
+            EP_HOST_ASSERT(bias.dim() == 2 and bias.is_contiguous());
+            EP_HOST_ASSERT(bias.scalar_type() == x.scalar_type());
+            EP_HOST_ASSERT(bias.size(0) == num_recv_tokens and bias.size(1) == hidden);
+            bias_ptrs[i] = bias.data_ptr();
+        }
+
+    // Allocate output tensor with correct size (num_recv_tokens is the original token count)
+    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    EP_HOST_ASSERT(num_channels * num_ranks * sizeof(int) * 2 +  // Queue head and tail
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * hidden * x.element_size() +  // Data buffer
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +             // Source index buffer
+                       num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
+                   <= num_nvl_bytes);
+
+    // Call combine kernel
+    intranode::combine(nullptr,  // type placeholder for SYCL
+                       recv_x.data_ptr(),
+                       recv_topk_weights_ptr,
+                       x.data_ptr(),
+                       topk_weights_ptr,
+                       bias_ptrs[0],
+                       bias_ptrs[1],
+                       src_idx.data_ptr<int>(),
+                       rank_prefix_matrix.data_ptr<int>(),
+                       channel_prefix_matrix.data_ptr<int>(),
+                       send_head.data_ptr<int>(),
+                       num_tokens,
+                       num_recv_tokens,
+                       hidden,
+                       num_topk,
+                       buffer_ptrs_gpu,
+                       rank,
+                       num_ranks,
+                       comm_stream,
+                       config.num_sms,
+                       config.num_max_nvl_chunked_send_tokens,
+                       config.num_max_nvl_chunked_recv_tokens);
+
+    // Wait for completion if not async
+    if (!async) {
+        comm_stream.wait();
+    }
+
+    return std::make_tuple(recv_x, recv_topk_weights, std::nullopt);
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<deep_ep::EventHandle>>
