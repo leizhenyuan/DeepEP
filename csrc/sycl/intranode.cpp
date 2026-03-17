@@ -76,11 +76,11 @@ public:
         if (sm_id == 0) {
 
             if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_cas #1 (init)" << sycl::endl;
+                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_bypass #1 (init)" << sycl::endl;
             }
-            barrier_block_cas<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
             if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_cas #1 (init)" << sycl::endl;
+                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_bypass #1 (init)" << sycl::endl;
             }
 
             int *per_rank_buffer, *per_expert_buffer;
@@ -106,11 +106,11 @@ public:
 
             // 等待所有rank完成统计
             if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_cas #2 (after write)" << sycl::endl;
+                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_bypass #2 (after write)" << sycl::endl;
             }
-            barrier_block_cas<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
             if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_cas #2 (after write)" << sycl::endl;
+                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_bypass #2 (after write)" << sycl::endl;
             }
 
             // 打印所有 rank 的 per_rank_buffer 和 per_expert_buffer（barrier后所有数据可见）
@@ -195,11 +195,11 @@ public:
 
             // 最终Barrier同步
             if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_cas #3 (final)" << sycl::endl;
+                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_bypass #3 (final)" << sycl::endl;
             }
-            barrier_block_cas<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
             if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_cas #3 (final)" << sycl::endl;
+                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_bypass #3 (final)" << sycl::endl;
             }
             
             
@@ -1028,7 +1028,7 @@ public:
             // Block 0: 清理IPC Buffer
 
             // Barrier before cleaning
-            barrier_block_cas<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
 
             // Clean buffer
             auto ptr = static_cast<int*>(buffer_ptrs_[rank_]);
@@ -1037,7 +1037,7 @@ public:
                 ptr[i] = 0;
 
             // Barrier after cleaning
-            barrier_block_cas<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
         } else {
             // Block 1 ~ num_channels: 补全send_head数组
             const auto channel_id = sm_id - 1;
@@ -1757,7 +1757,7 @@ void combine(std::nullptr_t type,
 }
 
 // ============================================================================
-// barrier kernel - SYCL版本 (使用 barrier_block_cas)
+// barrier kernel - SYCL版本 (使用 barrier_block_bypass)
 // ============================================================================
 
 template <int kNumRanks>
@@ -1770,7 +1770,7 @@ public:
 
     void operator()(sycl::nd_item<1> item) const {
         // 使用 CAS-based barrier
-        barrier_block_cas<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+        barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
     }
 
 private:

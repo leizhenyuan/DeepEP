@@ -207,6 +207,9 @@ SYCL_EXTERNAL inline void st_na_global(T* ptr, T value) {
 }
 
 #ifdef __SYCL_DEVICE_ONLY__
+
+// ---- uncached load (lsc_load.ugm.uc.uc = L1 uncached, L3 uncached) ----
+
 inline int ld_volatile_global(const int* addr) {
     int result;
     asm volatile (
@@ -215,11 +218,37 @@ inline int ld_volatile_global(const int* addr) {
     );
     return result;
 }
+
+inline int64_t ld_volatile_global(const int64_t* addr) {
+    int64_t result;
+    asm volatile (
+        "lsc_load.ugm.uc.uc (M1, 32) %0:d64 flat[%1]:a64"
+        : "=rw"(result) : "rw"(addr)
+    );
+    return result;
+}
+
+
+inline void st_volatile_global(int* addr, int value) {
+    asm volatile (
+        "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32"
+        : : "rw"(addr), "rw"(value) : "memory"
+    );
+}
+
+inline void st_volatile_global(int64_t* addr, int64_t value) {
+    asm volatile (
+        "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d64"
+        : : "rw"(addr), "rw"(value) : "memory"
+    );
+}
+
 #else
 // todo: Host fallback 感觉应该添加一个runtime error
-inline int ld_volatile_global(const int* addr) {
-    return *addr;
-}
+inline int ld_volatile_global(const int* addr) { return *addr; }
+inline int64_t ld_volatile_global(const int64_t* addr) { return *addr; }
+inline void st_volatile_global(int* addr, int value) { *addr = value; }
+inline void st_volatile_global(int64_t* addr, int64_t value) { *addr = value; }
 #endif
 
 SYCL_EXTERNAL inline int ld_volatile_global_cas(int* ptr) {
@@ -516,6 +545,48 @@ SYCL_EXTERNAL inline void barrier_verify_kernel(int** barrier_signal_ptrs, int r
     }
 }
 
+
+// ============================================================================
+// barrier_block_bypass: 使用 bypass-cache load (lsc_load.ugm.uc.uc) 的 barrier
+// ============================================================================
+// 算法与 CUDA 原版 barrier_block 一致：
+//   1. atomicAdd_system 到自身槽位 ptrs[rank][thread_id] += FINISHED_SUM_TAG
+//   2. atomicSub_system 到对端槽位 ptrs[thread_id][rank] -= FINISHED_SUM_TAG
+//   3. 用 bypass-cache volatile load 轮询 ptrs[rank][thread_id] 直到 <= 0
+//
+// 关键优势：
+//   - ld_volatile_global 使用 lsc_load.ugm.uc.uc 硬件级绕过 L1/L3 缓存，
+//     确保每次读到内存中最新值，等价于 CUDA 的 ld.volatile.global
+//   - 比 CAS-based barrier 更轻量、更接近 CUDA 原版语义
+// ============================================================================
+template <int kNumRanks, bool kSyncOnly = false>
+SYCL_EXTERNAL inline void barrier_block_bypass(int** barrier_signal_ptrs, int rank,
+                                                sycl::nd_item<1>& item,
+                                                const sycl::stream* debug_stream = nullptr) {
+    auto thread_id = static_cast<int>(item.get_local_id(0));
+
+    // 确保之前的内存操作对 system scope 可见
+    if constexpr (!kSyncOnly) {
+        memory_fence_system();
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    // Add to self slot, sub from peer slot
+    if (thread_id < kNumRanks) {
+        atomic_add_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
+        atomic_sub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+    }
+
+    // Spin-wait: 使用 bypass-cache load (lsc_load.ugm.uc.uc) 轮询
+    if (thread_id < kNumRanks) {
+        while (ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) > 0) {
+            // spin — bypass cache 确保每次读到最新值
+        }
+    }
+
+    item.barrier(sycl::access::fence_space::local_space);
+}
+
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank, 
                                             sycl::nd_item<1>& item, 
@@ -528,11 +599,7 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     auto sg_id = thread_id / sg_size;
     
     constexpr size_t MAX_SPIN = 10000000;
-    
-    // if (lane_id == 0 && debug_stream && sg_id < kNumRanks) {
-    //     *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-    //                  << "] sg_id=" << sg_id << ", lane_id=" << lane_id << sycl::endl;
-    // }
+
     if (thread_id < kNumRanks) {
         *debug_stream << "[Rank " << rank << "][Thread " << thread_id << "]" << sycl::endl;
     }
@@ -554,20 +621,6 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
 
         int add_tag = rank * 1000 + thread_id;
         self_ref.store(add_tag, sycl::memory_order::acq_rel);
-        // for (size_t i = 0; i < MAX_SPIN; ++i) {
-        //     int expected = 0;
-        //     if (self_ref.store(add_tag, sycl::memory_order::release)) {
-        //         break;
-        //     }
-        //     add_spins = i;
-        // }
-        
-        if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] ADD_SELF: [" << rank << "][" << thread_id 
-                         << "] 0 -> " << add_tag 
-                         << ", spins=" << add_spins << sycl::endl;
-        }
     }
     sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
     item.barrier(sycl::access::fence_space::local_space);
@@ -581,8 +634,7 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
                          sycl::memory_order::acq_rel,
                          sycl::memory_scope::system> other_ref(*other_ptr);
         int sub_tag = thread_id * 1000 + rank;
-        *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                     << "] other_ptr:" << ld_volatile_global(other_ptr) << sycl::endl;
+
         for (size_t i = 0; ; ++i) {
 
             if (i % 100000 == 0) {
@@ -632,6 +684,89 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     if (thread_id == 0 && debug_stream) {
         *debug_stream << "[Rank " << rank << "] barrier_block_cas EXIT: SUCCESS" << sycl::endl;
     }
+}
+
+// ============================================================================
+// barrier_block_noatomic: 不使用 atomic RMW，仅用 release-store + acquire-load
+// ============================================================================
+// 原理：每个地址 ptrs[X][Y] 只有一个 writer（Rank X, thread Y）和一个 reader
+// （Rank Y, thread X），因此不需要 atomic RMW（如 CAS/Add/Sub）。
+// 只需保证跨设备可见性：
+//   - store 用 release + system scope（穿透缓存，确保之前的数据写入可见）
+//   - load 用 acquire + system scope（绕过缓存，读到最新值）
+//
+// 关于可重复性：使用 epoch 单调递增，避免固定 tag 只能用一次的问题。
+// epoch 由调用者维护，每次 barrier 调用时 +1。
+// 初始时所有 signal 槽位应为 0，首次调用 epoch=1。
+//
+// 注意：epoch 使用 int64_t，即使每秒 10 亿次调用也需要 ~292 年才溢出。
+// 如果使用 int（~21 亿次溢出），几十亿次调用后会 wrap 产生假匹配。
+// ============================================================================
+template <int kNumRanks, bool kSyncOnly = false>
+SYCL_EXTERNAL inline void barrier_block_noatomic(int64_t** barrier_signal_ptrs, int rank,
+                                                  int64_t epoch,
+                                                  sycl::nd_item<1>& item,
+                                                  const sycl::stream* debug_stream = nullptr) {
+    auto thread_id = static_cast<int>(item.get_local_id(0));
+
+    // Step 0: 确保之前的数据写入对 system scope 可见
+    if constexpr (!kSyncOnly) {
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    // Step 1: 写信号到自己的槽位 ptrs[rank][thread_id]
+    // 只有一个 writer，不需要 atomic RMW，release-store 即可
+    if (thread_id < kNumRanks) {
+        st_release_sys_global<int64_t>(barrier_signal_ptrs[rank] + thread_id, epoch);
+    }
+
+    // fence + local barrier 确保 store 已发出
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    item.barrier(sycl::access::fence_space::local_space);
+
+    // Step 2: 轮询远端槽位 ptrs[thread_id][rank]，等待远端 rank 写入 epoch
+    // 只有一个 reader，不需要 atomic RMW，acquire-load 即可
+    if (thread_id < kNumRanks) {
+        while (ld_acquire_sys_global<int64_t>(barrier_signal_ptrs[thread_id] + rank) != epoch) {
+            // spin — acquire load 绕过缓存，每次读到最新值
+        }
+    }
+
+    item.barrier(sycl::access::fence_space::local_space);
+}
+
+// 与上面相同，但使用 ld_volatile_global（硬件级 bypass cache）替代 acquire-load
+// 在 Intel GPU 上对应 lsc_load.ugm.uc.uc，可能比 atomic_ref acquire load 更轻量
+template <int kNumRanks, bool kSyncOnly = false>
+SYCL_EXTERNAL inline void barrier_block_uncached(int64_t** barrier_signal_ptrs, int rank,
+                                                  int64_t epoch,
+                                                  sycl::nd_item<1>& item,
+                                                  const sycl::stream* debug_stream = nullptr) {
+    auto thread_id = static_cast<int>(item.get_local_id(0));
+
+    if constexpr (!kSyncOnly) {
+        sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    // release-store 信号
+    if (thread_id < kNumRanks) {
+        st_release_sys_global<int64_t>(barrier_signal_ptrs[rank] + thread_id, epoch);
+    }
+
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+    item.barrier(sycl::access::fence_space::local_space);
+
+    // volatile/uncached load 轮询远端
+    // 注意：ld_volatile_global 目前只支持 int，这里用 acquire load 替代
+    if (thread_id < kNumRanks) {
+        while (ld_acquire_sys_global<int64_t>(barrier_signal_ptrs[thread_id] + rank) != epoch) {
+            // spin — acquire load with system scope
+        }
+    }
+
+    item.barrier(sycl::access::fence_space::local_space);
 }
 
 template <int kNumRanks>

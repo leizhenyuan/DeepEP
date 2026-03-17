@@ -60,7 +60,7 @@ struct PatternVisitor {
 
     __device__ __host__ auto operator[](const uint32_t& i) { return func(i); }
 };
-
+// pattern:  指令:输出:输入:clobber（用来提示编译器这条内联汇编会破坏哪些输入输出以外的资源）
 __device__ __forceinline__ void trap() {
     asm("trap;");
 }
