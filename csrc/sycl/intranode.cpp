@@ -39,8 +39,7 @@ public:
         int expert_alignment,
         void** buffer_ptrs,
         int** barrier_signal_ptrs,
-        int rank,
-        const sycl::stream* debug_stream)
+        int rank)
         : num_tokens_per_rank_(num_tokens_per_rank),
           moe_recv_counter_mapped_(moe_recv_counter_mapped),
           num_tokens_per_expert_(num_tokens_per_expert),
@@ -55,8 +54,7 @@ public:
           expert_alignment_(expert_alignment),
           buffer_ptrs_(buffer_ptrs),
           barrier_signal_ptrs_(barrier_signal_ptrs),
-          rank_(rank),
-          debug_stream_(debug_stream) {}
+          rank_(rank) {}
 
     void operator()(sycl::nd_item<1> item) const {
         auto sm_id = static_cast<int>(item.get_group(0));
@@ -67,21 +65,11 @@ public:
         auto num_warps = num_threads / 32;
 
         if (sm_id == 0 && thread_id == 0) {
-            if (debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] NotifyDispatchKernel: ENTERED, sm_id=" << sm_id 
-                              << ", num_threads=" << num_threads << sycl::endl;
-            }
         }
 
         if (sm_id == 0) {
 
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_bypass #1 (init)" << sycl::endl;
-            }
-            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_bypass #1 (init)" << sycl::endl;
-            }
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item);
 
             int *per_rank_buffer, *per_expert_buffer;
             // 每个线程负责一个rank
@@ -105,45 +93,9 @@ public:
             }
 
             // 等待所有rank完成统计
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_bypass #2 (after write)" << sycl::endl;
-            }
-            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_bypass #2 (after write)" << sycl::endl;
-            }
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item);
 
             // 打印所有 rank 的 per_rank_buffer 和 per_expert_buffer（barrier后所有数据可见）
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] === per_rank_buffer (before prefix sum) ===" << sycl::endl;
-                for (int r = 0; r < kNumRanks; ++r) {
-                    auto buf = static_cast<int*>(buffer_ptrs_[r]);
-                    *debug_stream_ << "  buffer_ptrs_[" << r << "] per_rank_buffer:" << sycl::endl;
-                    for (int row = 0; row < kNumRanks; ++row) {
-                        *debug_stream_ << "    row " << row << ": [";
-                        for (int col = 0; col < kNumRanks; ++col) {
-                            *debug_stream_ << buf[row * kNumRanks + col];
-                            if (col < kNumRanks - 1) *debug_stream_ << ", ";
-                        }
-                        *debug_stream_ << "]" << sycl::endl;
-                    }
-                }
-                
-                *debug_stream_ << "[Rank " << rank_ << "] === per_expert_buffer ===" << sycl::endl;
-                int num_experts_per_rank_local = num_experts_ / kNumRanks;
-                for (int r = 0; r < kNumRanks; ++r) {
-                    auto buf = static_cast<int*>(buffer_ptrs_[r]) + kNumRanks * kNumRanks;
-                    *debug_stream_ << "  buffer_ptrs_[" << r << "] per_expert_buffer:" << sycl::endl;
-                    for (int row = 0; row < kNumRanks; ++row) {
-                        *debug_stream_ << "    row " << row << " (from rank " << row << "): [";
-                        for (int col = 0; col < num_experts_per_rank_local; ++col) {
-                            *debug_stream_ << buf[row * num_experts_per_rank_local + col];
-                            if (col < num_experts_per_rank_local - 1) *debug_stream_ << ", ";
-                        }
-                        *debug_stream_ << "]" << sycl::endl;
-                    }
-                }
-            }
 
             auto local_per_rank_buffer = static_cast<int*>(buffer_ptrs_[rank_]);
             if (thread_id < kNumRanks) {
@@ -181,26 +133,9 @@ public:
 
             // 打印 rank_prefix_matrix_copy_ 结果
             item.barrier(sycl::access::fence_space::local_space);
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] rank_prefix_matrix_copy_ (row=src_rank, col=dst_rank):" << sycl::endl;
-                for (int row = 0; row < kNumRanks; ++row) {
-                    *debug_stream_ << "  row " << row << ": [";
-                    for (int col = 0; col < kNumRanks; ++col) {
-                        *debug_stream_ << rank_prefix_matrix_copy_[row * kNumRanks + col];
-                        if (col < kNumRanks - 1) *debug_stream_ << ", ";
-                    }
-                    *debug_stream_ << "]" << sycl::endl;
-                }
-            }
 
             // 最终Barrier同步
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] BEFORE barrier_block_bypass #3 (final)" << sycl::endl;
-            }
-            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
-            if (thread_id == 0 && debug_stream_ != nullptr) {
-                *debug_stream_ << "[Rank " << rank_ << "] AFTER barrier_block_bypass #3 (final)" << sycl::endl;
-            }
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item);
             
             
         } 
@@ -261,7 +196,6 @@ private:
     void** buffer_ptrs_;
     int** barrier_signal_ptrs_;
     int rank_;
-    const sycl::stream* debug_stream_;
 };
 
 void notify_dispatch(const int* num_tokens_per_rank,
@@ -307,8 +241,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
     #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                          \
         case ranks: {                                                                   \
                 stream.submit([&](sycl::handler& cgh) {                                \
-                    sycl::stream debug_stream(1024*1024, 10240, cgh);                   \
-                    cgh.parallel_for(                                                  \
+                                                                                                            cgh.parallel_for(                                                  \
                         sycl::nd_range<1>(global_range, local_range),                 \
                         [=](sycl::nd_item<1> item) {                                  \
                             NotifyDispatchKernel<ranks> kernel(                       \
@@ -326,8 +259,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                                 expert_alignment,                                      \
                                 buffer_ptrs,                                           \
                                 barrier_signal_ptrs,                                   \
-                                rank,                                                  \
-                                &debug_stream);                                          \
+                                rank);                                                   \
                             kernel(item);                                              \
                         });                                                            \
                 });                                                                    \
@@ -370,14 +302,12 @@ public:
         int num_memset_int,
         void** buffer_ptrs,
         int** barrier_signal_ptrs,
-        int rank,
-        const sycl::stream* debug_stream)
+        int rank)
         : rank_prefix_matrix_(rank_prefix_matrix),
           num_memset_int_(num_memset_int),
           buffer_ptrs_(buffer_ptrs),
           barrier_signal_ptrs_(barrier_signal_ptrs),
-          rank_(rank),
-          debug_stream_(debug_stream) {}
+          rank_(rank) {}
 
     void operator()(sycl::nd_item<1> item) const {
         auto thread_id = static_cast<int>(item.get_local_id(0));
@@ -407,7 +337,6 @@ private:
     void** buffer_ptrs_;
     int** barrier_signal_ptrs_;
     int rank_;
-    const sycl::stream* debug_stream_;
 };
 
 // ============================================================================
@@ -430,9 +359,8 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 
     #define CACHED_NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                   \
         case ranks:                                                                     \
-            stream.submit([&](sycl::handler& cgh) {                                    \
-                sycl::stream debug_stream(1024*1024, 1024, cgh);                       \
-                cgh.parallel_for(                                                      \
+            stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                        cgh.parallel_for(                                                      \
                     sycl::nd_range<1>(global_range, local_range),                     \
                     [=](sycl::nd_item<1> item) {                                      \
                         CachedNotifyDispatchKernel<ranks> kernel(                     \
@@ -440,8 +368,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
                             num_memset_int,                                            \
                             buffer_ptrs,                                               \
                             barrier_signal_ptrs,                                       \
-                            rank,                                                      \
-                            &debug_stream);                                            \
+                            rank);                                                     \
                         kernel(item);                                                  \
                     });                                                                \
             });                                                                        \
@@ -488,8 +415,7 @@ public:
         int rank,
         int num_max_send_tokens,
         int num_recv_buffer_tokens,
-        int* shared_channel_tail_idx_ptr,
-        sycl::stream debug_stream)
+        int* shared_channel_tail_idx_ptr)
         : recv_x_(recv_x),
           recv_x_scales_(recv_x_scales),
           recv_src_idx_(recv_src_idx),
@@ -515,8 +441,7 @@ public:
           rank_(rank),
           num_max_send_tokens_(num_max_send_tokens),
           num_recv_buffer_tokens_(num_recv_buffer_tokens),
-          shared_channel_tail_idx_(shared_channel_tail_idx_ptr),
-          debug_stream_(debug_stream) {}
+          shared_channel_tail_idx_(shared_channel_tail_idx_ptr) {}
 
     void operator()(sycl::nd_item<1> item) const {
         const auto num_sms = static_cast<int>(item.get_group_range(0));
@@ -625,15 +550,9 @@ private:
             int value = responsible_channel > 0 ? 
                 channel_prefix_matrix_[responsible_rank * num_channels + responsible_channel - 1] : 0;
             st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
-            debug_stream_ << "[dispatch_sender] rank=" << rank_ << " resp_rank=" << responsible_rank
-                         << " wrote start_offset: value=" << value << " encoded=" << (-value - 1) 
-                         << " to addr=" << (void*)channel_start_offset.buffer() << sycl::endl;
             
             value = channel_prefix_matrix_[responsible_rank * num_channels + responsible_channel];
             st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
-            debug_stream_ << "[dispatch_sender] rank=" << rank_ << " resp_rank=" << responsible_rank
-                         << " wrote end_offset: value=" << value << " encoded=" << (-value - 1)
-                         << " to addr=" << (void*)channel_end_offset.buffer() << sycl::endl;
         }
         sycl::group_barrier(item.get_sub_group());
 
@@ -654,7 +573,6 @@ private:
                     }
                     loop_count++;
                     if (loop_count > 100000000) {
-                        debug_stream_ << "[dispatch_sender] rank=" << rank_ << " TIMEOUT waiting for slots!" << sycl::endl;
                         break;
                     }
                 }
@@ -757,7 +675,6 @@ private:
             while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0) {
                 loop_count++;
                 if (loop_count > 100000000) {
-                    debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " TIMEOUT waiting for start_offset!" << sycl::endl;
                     break;
                 }
             }
@@ -766,7 +683,6 @@ private:
             while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0) {
                 loop_count++;
                 if (loop_count > 100000000) {
-                    debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " TIMEOUT waiting for end_offset!" << sycl::endl;
                     break;
                 }
             }
@@ -795,7 +711,6 @@ private:
                     }
                     loop_count++;
                     if (loop_count > 100000000) {
-                        debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " TIMEOUT waiting for tail_idx!" << sycl::endl;
                         // Set to head so we get 0 tokens and can exit
                         cached_channel_tail_idx = cached_channel_head_idx;
                         break;
@@ -894,7 +809,6 @@ private:
     int num_max_send_tokens_;
     int num_recv_buffer_tokens_;
     int* shared_channel_tail_idx_;
-    sycl::stream debug_stream_;
 };
 
 void dispatch(void* recv_x,
@@ -943,10 +857,8 @@ void dispatch(void* recv_x,
     case ranks:                                                                                         \
         stream.submit([&](sycl::handler& cgh) {                                                        \
             /* Local memory for shared_channel_tail_idx */                                             \
-            sycl::local_accessor<int, 1> shared_tail_idx(sycl::range<1>(ranks), cgh);                  \
-            /* Debug stream for kernel printf */                                                       \
-            sycl::stream debug_stream(1024 * 1024, 256, cgh);                                          \
-            cgh.parallel_for(                                                                          \
+            sycl::local_accessor<int, 1> shared_tail_idx(sycl::range<1>(ranks), cgh);                                \
+                                                                                                                    cgh.parallel_for(                                                                          \
                 sycl::nd_range<1>(global_range, local_range),                                          \
                 [=](sycl::nd_item<1> item) {                                                           \
                     DispatchKernel<ranks, kNumThreads> kernel(                                         \
@@ -975,8 +887,7 @@ void dispatch(void* recv_x,
                         rank,                                                                          \
                         num_max_send_tokens,                                                           \
                         num_recv_buffer_tokens,                                                        \
-                        shared_tail_idx.get_pointer(),                                                 \
-                        debug_stream);                                                                 \
+                        shared_tail_idx.get_pointer());                                                \
                     kernel(item);                                                                      \
                 });                                                                                    \
         });                                                                                            \
@@ -1008,16 +919,14 @@ public:
         int num_recv_tokens,
         int num_memset_int,
         int** barrier_signal_ptrs,
-        int rank,
-        const sycl::stream* debug_stream)
+        int rank)
         : buffer_ptrs_(buffer_ptrs),
           send_head_(send_head),
           num_channels_(num_channels),
           num_recv_tokens_(num_recv_tokens),
           num_memset_int_(num_memset_int),
           barrier_signal_ptrs_(barrier_signal_ptrs),
-          rank_(rank),
-          debug_stream_(debug_stream) {}
+          rank_(rank) {}
 
     void operator()(sycl::nd_item<1> item) const {
         auto sm_id = static_cast<int>(item.get_group(0));
@@ -1028,7 +937,7 @@ public:
             // Block 0: 清理IPC Buffer
 
             // Barrier before cleaning
-            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item);
 
             // Clean buffer
             auto ptr = static_cast<int*>(buffer_ptrs_[rank_]);
@@ -1037,7 +946,7 @@ public:
                 ptr[i] = 0;
 
             // Barrier after cleaning
-            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+            barrier_block_bypass<kNumRanks>(barrier_signal_ptrs_, rank_, item);
         } else {
             // Block 1 ~ num_channels: 补全send_head数组
             const auto channel_id = sm_id - 1;
@@ -1096,7 +1005,6 @@ private:
     int num_memset_int_;
     int** barrier_signal_ptrs_;
     int rank_;
-    const sycl::stream* debug_stream_;
 };
 
 void cached_notify_combine(void** buffer_ptrs,
@@ -1127,9 +1035,8 @@ void cached_notify_combine(void** buffer_ptrs,
 
     #define CACHED_NOTIFY_COMBINE_LAUNCH_CASE(ranks)                                    \
         case ranks:                                                                     \
-            stream.submit([&](sycl::handler& cgh) {                                    \
-                sycl::stream debug_stream(1024*1024, 1024, cgh);                       \
-                cgh.parallel_for(                                                      \
+            stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                        cgh.parallel_for(                                                      \
                     sycl::nd_range<1>(global_range, local_range),                     \
                     [=](sycl::nd_item<1> item) {                                      \
                         CachedNotifyCombineKernel<ranks> kernel(                       \
@@ -1139,8 +1046,7 @@ void cached_notify_combine(void** buffer_ptrs,
                             num_recv_tokens,                                           \
                             num_memset_int,                                            \
                             barrier_signal_ptrs,                                       \
-                            rank,                                                      \
-                            &debug_stream);                                            \
+                            rank);                                                     \
                         kernel(item);                                                  \
                     });                                                                \
             });                                                                        \
@@ -1182,8 +1088,7 @@ public:
         int rank,
         int num_sms,
         int num_max_send_tokens,
-        int num_recv_buffer_tokens,
-        const sycl::stream* debug_stream)
+        int num_recv_buffer_tokens)
         : recv_x_(recv_x),
           recv_topk_weights_(recv_topk_weights),
           x_(x),
@@ -1202,8 +1107,7 @@ public:
           rank_(rank),
           num_sms_(num_sms),
           num_max_send_tokens_(num_max_send_tokens),
-          num_recv_buffer_tokens_(num_recv_buffer_tokens),
-          debug_stream_(debug_stream) {}
+          num_recv_buffer_tokens_(num_recv_buffer_tokens) {}
 
     void operator()(sycl::nd_item<1> item,
                     volatile int* warp_channel_head_idx,  // [num_recv_warps][kNumRanks]
@@ -1321,22 +1225,6 @@ private:
                 }
                 
                 // 调试日志：打印发送信息
-                if (lane_id == 0 && debug_stream_ != nullptr) {
-                    auto sm_id = static_cast<int>(item.get_group(0));
-                    // 读取 embedding[0] 的数据 (第一个 int4，包含多个 dtype_t 元素)
-                    int4 first_int4 = ld_nc_global(shifted_x);
-                    auto first_values = reinterpret_cast<const dtype_t*>(&first_int4);
-                    *debug_stream_ << "[COMBINE_SENDER] Rank " << rank_ 
-                                   << ", SM " << sm_id 
-                                   << ", Channel " << responsible_channel
-                                   << ", Warp " << send_warp_id
-                                   << " -> DestRank " << send_rank_id
-                                   << ": Token " << (token_idx + i) 
-                                   << " -> Slot " << dst_slot_idx
-                                   << ", src_idx=" << src_idx_[token_idx + i]
-                                   << ", embed[0]=" << static_cast<float>(first_values[0])
-                                   << sycl::endl;
-                }
                 
                 // 发送src_idx
                 if (elect_one_sync(item)) {
@@ -1514,30 +1402,6 @@ private:
                 }
                 
                 // 调试日志：打印接收信息（只有lane 0打印）
-                if (lane_id == 0 && debug_stream_ != nullptr) {
-                    auto sm_id = static_cast<int>(item.get_group(0));
-                    *debug_stream_ << "[COMBINE_RECEIVER] Rank " << rank_ 
-                                   << ", SM " << sm_id 
-                                   << ", Channel " << responsible_channel
-                                   << ", Warp " << recv_warp_id
-                                   << ": OutputToken " << token_idx 
-                                   << ", num_sources=" << num_topk_ranks
-                                   << sycl::endl;
-                    
-                    // 打印每个来源的详细信息
-                    for (int src = 0; src < num_topk_ranks; ++src) {
-                        int src_rank = topk_ranks[src];
-                        int src_slot = slot_indices[src];
-                        // 读取该来源的embedding[0]
-                        int4 src_first_int4 = ld_nc_global(
-                            channel_x_buffers[src_rank].buffer() + src_slot * hidden_int4);
-                        auto src_first_values = reinterpret_cast<const dtype_t*>(&src_first_int4);
-                        *debug_stream_ << "    Source[" << src << "]: FromRank " << src_rank
-                                       << ", Slot " << src_slot
-                                       << ", embed[0]=" << static_cast<float>(src_first_values[0])
-                                       << sycl::endl;
-                    }
-                }
                 
                 // Reduce数据
                 for (int i = lane_id; i < hidden_int4; i += 32) {
@@ -1584,16 +1448,6 @@ private:
                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
                     
                     // 调试日志：打印输出结果的embedding[0]（只有处理第一个int4的lane打印）
-                    if (i == 0 && debug_stream_ != nullptr) {
-                        auto sm_id = static_cast<int>(item.get_group(0));
-                        *debug_stream_ << "[COMBINE_RECEIVER_OUT] Rank " << rank_ 
-                                       << ", SM " << sm_id 
-                                       << ", Channel " << responsible_channel
-                                       << ", Warp " << recv_warp_id
-                                       << ": OutputToken " << token_idx 
-                                       << ", output_embed[0]=" << static_cast<float>(out_dtypes[0])
-                                       << sycl::endl;
-                    }
                 }
                 
                 // Reduce topk_weights
@@ -1642,7 +1496,6 @@ private:
     int num_sms_;
     int num_max_send_tokens_;
     int num_recv_buffer_tokens_;
-    const sycl::stream* debug_stream_;
 };
 
 void combine(std::nullptr_t type,
@@ -1687,9 +1540,8 @@ void combine(std::nullptr_t type,
     // 根据num_ranks选择模板实例
     #define COMBINE_LAUNCH_CASE(ranks)                                                      \
         case ranks: {                                                                       \
-            stream.submit([&](sycl::handler& cgh) {                                        \
-                sycl::stream debug_stream(1024*1024, 10240, cgh);                          \
-                /* Shared memory for receiver coordination */                              \
+            stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                            /* Shared memory for receiver coordination */                              \
                 sycl::local_accessor<int, 1> warp_channel_head_idx_acc(                   \
                     sycl::range<1>(num_recv_warps * ranks), cgh);                          \
                 sycl::local_accessor<int, 1> channel_tail_idx_acc(                        \
@@ -1719,8 +1571,7 @@ void combine(std::nullptr_t type,
                             rank,                                                          \
                             num_sms,                                                       \
                             num_max_send_tokens,                                           \
-                            num_recv_buffer_tokens,                                        \
-                            &debug_stream);                                                \
+                            num_recv_buffer_tokens);                                       \
                         kernel(item,                                                       \
                                warp_channel_head_idx_acc.get_pointer(),                   \
                                channel_tail_idx_acc.get_pointer(),                        \
@@ -1763,20 +1614,18 @@ void combine(std::nullptr_t type,
 template <int kNumRanks>
 class BarrierKernel {
 public:
-    BarrierKernel(int** barrier_signal_ptrs, int rank, const sycl::stream* debug_stream)
+    BarrierKernel(int** barrier_signal_ptrs, int rank)
         : barrier_signal_ptrs_(barrier_signal_ptrs),
-          rank_(rank),
-          debug_stream_(debug_stream) {}
+          rank_(rank) {}
 
     void operator()(sycl::nd_item<1> item) const {
         // 使用 CAS-based barrier
-        barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+        barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item);
     }
 
 private:
     int** barrier_signal_ptrs_;
     int rank_;
-    const sycl::stream* debug_stream_;
 };
 
 void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& stream) {
@@ -1790,15 +1639,13 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& st
     #define BARRIER_LAUNCH_CASE(ranks)                                              \
         case ranks: {                                                               \
             try {                                                                   \
-                stream.submit([&](sycl::handler& cgh) {                            \
-                    sycl::stream debug_stream(1024*1024, 1024, cgh);               \
-                    cgh.parallel_for(                                              \
+                stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                        cgh.parallel_for(                                              \
                         sycl::nd_range<1>(global_range, local_range),             \
                         [=](sycl::nd_item<1> item) {                              \
                             BarrierKernel<ranks> kernel(                          \
                                 barrier_signal_ptrs,                               \
-                                rank,                                              \
-                                &debug_stream);                                    \
+                                rank);                                             \
                             kernel(item);                                          \
                         });                                                        \
                 });                                                                \
@@ -1832,20 +1679,18 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& st
 template <int kNumRanks>
 class IPCTestWriteKernel {
 public:
-    IPCTestWriteKernel(int** barrier_signal_ptrs, int rank, const sycl::stream* debug_stream)
+    IPCTestWriteKernel(int** barrier_signal_ptrs, int rank)
         : barrier_signal_ptrs_(barrier_signal_ptrs),
-          rank_(rank),
-          debug_stream_(debug_stream) {}
+          rank_(rank) {}
 
     void operator()(sycl::nd_item<1> item) const {
         // 使用新的简洁 barrier_block_write
-        barrier_block_write<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+        barrier_block_write<kNumRanks>(barrier_signal_ptrs_, rank_, item);
     }
 
 private:
     int** barrier_signal_ptrs_;
     int rank_;
-    const sycl::stream* debug_stream_;
 };
 
 void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& stream) {
@@ -1859,15 +1704,13 @@ void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::qu
     #define IPC_WRITE_LAUNCH_CASE(ranks)                                            \
         case ranks: {                                                               \
             try {                                                                   \
-                stream.submit([&](sycl::handler& cgh) {                            \
-                    sycl::stream debug_stream(1024*1024, 1024, cgh);               \
-                    cgh.parallel_for(                                              \
+                stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                        cgh.parallel_for(                                              \
                         sycl::nd_range<1>(global_range, local_range),             \
                         [=](sycl::nd_item<1> item) {                              \
                             IPCTestWriteKernel<ranks> kernel(                      \
                                 barrier_signal_ptrs,                               \
-                                rank,                                              \
-                                &debug_stream);                                    \
+                                rank);                                             \
                             kernel(item);                                          \
                         });                                                        \
                 });                                                                \
@@ -1901,20 +1744,18 @@ void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::qu
 template <int kNumRanks>
 class IPCTestReadKernel {
 public:
-    IPCTestReadKernel(int** barrier_signal_ptrs, int rank, const sycl::stream* debug_stream)
+    IPCTestReadKernel(int** barrier_signal_ptrs, int rank)
         : barrier_signal_ptrs_(barrier_signal_ptrs),
-          rank_(rank),
-          debug_stream_(debug_stream) {}
+          rank_(rank) {}
 
     void operator()(sycl::nd_item<1> item) const {
         // 使用新的简洁 barrier_block_read
-        barrier_block_read<kNumRanks>(barrier_signal_ptrs_, rank_, item, debug_stream_);
+        barrier_block_read<kNumRanks>(barrier_signal_ptrs_, rank_, item);
     }
 
 private:
     int** barrier_signal_ptrs_;
     int rank_;
-    const sycl::stream* debug_stream_;
 };
 
 void ipc_test_read(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& stream) {
@@ -1928,15 +1769,13 @@ void ipc_test_read(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::que
     #define IPC_READ_LAUNCH_CASE(ranks)                                             \
         case ranks: {                                                               \
             try {                                                                   \
-                stream.submit([&](sycl::handler& cgh) {                            \
-                    sycl::stream debug_stream(1024*1024, 1024, cgh);               \
-                    cgh.parallel_for(                                              \
+                stream.submit([&](sycl::handler& cgh) {                                \
+                                                                                                        cgh.parallel_for(                                              \
                         sycl::nd_range<1>(global_range, local_range),             \
                         [=](sycl::nd_item<1> item) {                              \
                             IPCTestReadKernel<ranks> kernel(                       \
                                 barrier_signal_ptrs,                               \
-                                rank,                                              \
-                                &debug_stream);                                    \
+                                rank);                                             \
                             kernel(item);                                          \
                         });                                                        \
                 });                                                                \

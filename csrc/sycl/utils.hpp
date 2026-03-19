@@ -349,7 +349,7 @@ SYCL_EXTERNAL inline int atomic_load_system_strong(int* ptr) {
 }
 
 template <int kNumRanks, bool kResetBarrier = false>
-SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, sycl::nd_item<1>& item, const sycl::stream* debug_stream = nullptr) {
+SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, sycl::nd_item<1>& item) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
     auto sg = item.get_sub_group();
     auto sm_id = static_cast<int>(item.get_group(0));
@@ -359,7 +359,6 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, syc
         memory_fence_system();
         item.barrier(sycl::access::fence_space::local_space);
     }
-    // *debug_stream << "[barrier_block] Rank " << rank << ", SM " << sm_id 
     //                  << ", thread " << thread_id << ": ENTERED" << sycl::endl;
 
 
@@ -374,8 +373,6 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, syc
                 ready_count = atomic_load_system_strong(barrier_signal_ptrs[rank] + thread_id);
             } while (ready_count < 100);  // 等待所有 rank 都写入了
             
-        *debug_stream << "Rank:" << rank << "Begin barrier wait at thread " << thread_id 
-                    << ", ready_count=" << ready_count << sycl::endl;
         // 使用最强语义的原子操作
         atomic_sub_system_strong(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG + 1);
         atomic_add_system_strong(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG - 1 - kNumRanks);
@@ -390,9 +387,6 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, syc
             spin_count++;
         } while (my_signal > 0 && spin_count < MAX_SPIN);
         
-        *debug_stream << "[barrier_block] Rank " << rank << ", thread " << thread_id 
-                    << ": Final signal=" << my_signal 
-                    << ", spins=" << spin_count << sycl::endl;
     }
 
     item.barrier(sycl::access::fence_space::local_space);
@@ -414,7 +408,6 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, syc
     //     item.barrier(sycl::access::fence_space::local_space);
         
     //     if (thread_id < kNumRanks and ii == 100000 -1) {
-    //         *debug_stream << "[barrier_block signals] Rank " << rank << ", SM " << sm_id 
     //                  << ", thread " << thread_id 
     //                  << ": Checking done=" << done 
     //                  << ", my_value=" << my_value 
@@ -427,14 +420,10 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, syc
     //     ii++;
         // timeout_count++;
         // if (timeout_count > MAX_TIMEOUT) {
-        //     if (thread_id == 0 && debug_stream != nullptr) {
-        //         *debug_stream << "[BARRIER TIMEOUT] Rank " << rank 
         //                      << ", SM " << sm_id 
         //                      << ": barrier_signal values = ";
         //         for (int i = 0; i < kNumRanks; i++) {
-        //             *debug_stream << *(barrier_signal_ptrs[rank] + i) << " ";
         //         }
-        //         *debug_stream << sycl::endl;
         //     }
         //     break;
         // }
@@ -442,9 +431,6 @@ SYCL_EXTERNAL inline void barrier_block(int** barrier_signal_ptrs, int rank, syc
 
     // item.barrier(sycl::access::fence_space::local_space);
 
-    if (thread_id == 0 && debug_stream != nullptr) {
-        *debug_stream << "[barrier_block] Rank " << rank << ", SM " << sm_id << " EXITED" << sycl::endl;
-    }
 }
 
 SYCL_EXTERNAL inline int atomic_add_global_cas(int* ptr, int value) {
@@ -489,13 +475,10 @@ SYCL_EXTERNAL inline int atomic_load_global(int* ptr) {
 
 template <int kNumRanks>
 SYCL_EXTERNAL inline void barrier_verify_kernel(int** barrier_signal_ptrs, int rank,
-                                                sycl::nd_item<1>& item,
-                                                const sycl::stream* debug_stream = nullptr) {
+                                                sycl::nd_item<1>& item
+) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
     
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] barrier_verify_kernel ENTER" << sycl::endl;
-    }
 
     int loop_count = 0;
     constexpr int MAX_LOOPS = 10000000;
@@ -513,36 +496,19 @@ SYCL_EXTERNAL inline void barrier_verify_kernel(int** barrier_signal_ptrs, int r
         bool my_done = (value == 0) || thread_id >= kNumRanks;
         bool all_done = sycl::all_of_group(item.get_group(), my_done);
         
-        if (debug_stream && thread_id < kNumRanks && (loop_count % LOG_INTERVAL == 0) && loop_count > 0) {
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] VERIFY: loop=" << loop_count 
-                         << ", value=" << value << sycl::endl;
-        }
         
         if (all_done) {
-            if (debug_stream && thread_id < kNumRanks && loop_count > 0) {
-                *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                             << "] VERIFIED: value=" << value 
-                             << ", loops=" << loop_count << sycl::endl;
-            }
             break;
         }
         
         loop_count++;
         if (loop_count > MAX_LOOPS) {
-            if (debug_stream && thread_id < kNumRanks) {
-                *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                             << "] VERIFY TIMEOUT! value=" << value << sycl::endl;
-            }
             break;
         }
     }
     
     item.barrier(sycl::access::fence_space::local_space);
     
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] barrier_verify_kernel EXIT" << sycl::endl;
-    }
 }
 
 
@@ -561,8 +527,8 @@ SYCL_EXTERNAL inline void barrier_verify_kernel(int** barrier_signal_ptrs, int r
 // ============================================================================
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block_bypass(int** barrier_signal_ptrs, int rank,
-                                                sycl::nd_item<1>& item,
-                                                const sycl::stream* debug_stream = nullptr) {
+                                                sycl::nd_item<1>& item
+) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
 
     // 确保之前的内存操作对 system scope 可见
@@ -589,8 +555,8 @@ SYCL_EXTERNAL inline void barrier_block_bypass(int** barrier_signal_ptrs, int ra
 
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank, 
-                                            sycl::nd_item<1>& item, 
-                                            const sycl::stream* debug_stream = nullptr) {
+                                            sycl::nd_item<1>& item
+) {
 
     auto thread_id = static_cast<int>(item.get_local_id(0));
     auto sg = item.get_sub_group();
@@ -601,7 +567,6 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     constexpr size_t MAX_SPIN = 10000000;
 
     if (thread_id < kNumRanks) {
-        *debug_stream << "[Rank " << rank << "][Thread " << thread_id << "]" << sycl::endl;
     }
     
     if constexpr (!kSyncOnly) {
@@ -644,23 +609,11 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
             sub_tag = thread_id * 1000 + rank;
             if (other_ref.load(sycl::memory_order::acquire) == sub_tag) {
                 self_done = true;
-                *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                             << "] SUB_OTHER SUCCESS: [" << thread_id << "][" << rank 
-                             << "] " << sub_tag << " -> 0"
-                             << ", spins=" << i 
-                             << ", self_done=" << (self_done ? 1 : 0) << sycl::endl;
                 break;
             }
             sub_spins = i;
         }
         
-        if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] SUB_OTHER: [" << thread_id << "][" << rank 
-                         << "] " << sub_tag << " -> 0"
-                         << ", spins=" << sub_spins 
-                         << ", self_done=" << (self_done ? 1 : 0) << sycl::endl;
-        }
     }
 
     item.barrier(sycl::access::fence_space::local_space);
@@ -669,21 +622,11 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
     bool all_done = sycl::all_of_group(item.get_group(), self_done);
     
     if (!all_done) {
-        if (thread_id == 0 && debug_stream) {
-            *debug_stream << "[Rank " << rank << "] BARRIER FAILED! Not all threads done." << sycl::endl;
-        }
         // 打印失败的线程
-        if (!self_done && debug_stream) {
-            *debug_stream << "[Rank " << rank << "][sg " << sg_id 
-                         << "] TIMEOUT: sub_spins=" << sub_spins << sycl::endl;
-        }
         item.barrier(sycl::access::fence_space::local_space);
         return;
     }
     
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] barrier_block_cas EXIT: SUCCESS" << sycl::endl;
-    }
 }
 
 // ============================================================================
@@ -705,8 +648,8 @@ SYCL_EXTERNAL inline void barrier_block_cas(int** barrier_signal_ptrs, int rank,
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block_noatomic(int64_t** barrier_signal_ptrs, int rank,
                                                   int64_t epoch,
-                                                  sycl::nd_item<1>& item,
-                                                  const sycl::stream* debug_stream = nullptr) {
+                                                  sycl::nd_item<1>& item
+) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
 
     // Step 0: 确保之前的数据写入对 system scope 可见
@@ -741,8 +684,8 @@ SYCL_EXTERNAL inline void barrier_block_noatomic(int64_t** barrier_signal_ptrs, 
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block_uncached(int64_t** barrier_signal_ptrs, int rank,
                                                   int64_t epoch,
-                                                  sycl::nd_item<1>& item,
-                                                  const sycl::stream* debug_stream = nullptr) {
+                                                  sycl::nd_item<1>& item
+) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
 
     if constexpr (!kSyncOnly) {
@@ -771,18 +714,11 @@ SYCL_EXTERNAL inline void barrier_block_uncached(int64_t** barrier_signal_ptrs, 
 
 template <int kNumRanks>
 SYCL_EXTERNAL inline void barrier_block_write(int** barrier_signal_ptrs, int rank, 
-                                               sycl::nd_item<1>& item, 
-                                               const sycl::stream* debug_stream = nullptr) {
+                                               sycl::nd_item<1>& item
+) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
     
     // 只有 thread 0 打印基地址信息
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] === LOCAL WRITE TEST ===" << sycl::endl;
-        *debug_stream << "[Rank " << rank << "] Writing to LOCAL memory only (barrier_signal_ptrs[" 
-                     << rank << "])" << sycl::endl;
-        *debug_stream << "[Rank " << rank << "] Local ptr = " 
-                     << (void*)barrier_signal_ptrs[rank] << sycl::endl;
-    }
     
     item.barrier(sycl::access::fence_space::local_space);
     
@@ -794,33 +730,18 @@ SYCL_EXTERNAL inline void barrier_block_write(int** barrier_signal_ptrs, int ran
         // 直接写入，不使用原子操作（本地内存）
         *write_ptr = write_value;
         
-        if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] WRITE: value=" << write_value << sycl::endl;
-        }
     }
     
     item.barrier(sycl::access::fence_space::local_space);
     
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] LOCAL WRITE TEST COMPLETE" << sycl::endl;
-    }
 }
 
 template <int kNumRanks>
 SYCL_EXTERNAL inline void barrier_block_read(int** barrier_signal_ptrs, int rank, 
-                                              sycl::nd_item<1>& item, 
-                                              const sycl::stream* debug_stream = nullptr) {
+                                              sycl::nd_item<1>& item
+) {
     auto thread_id = static_cast<int>(item.get_local_id(0));
     
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] === IPC READ TEST START ===" << sycl::endl;
-        *debug_stream << "[Rank " << rank << "] Reading barrier_signal_ptrs[thread_id] + rank" << sycl::endl;
-        for (int i = 0; i < kNumRanks; ++i) {
-            *debug_stream << "[Rank " << rank << "] barrier_signal_ptrs[" << i << "] = " 
-                         << (void*)barrier_signal_ptrs[i] << sycl::endl;
-        }
-    }
     
     item.barrier(sycl::access::fence_space::local_space);
     
@@ -830,31 +751,16 @@ SYCL_EXTERNAL inline void barrier_block_read(int** barrier_signal_ptrs, int rank
         int* read_ptr = barrier_signal_ptrs[thread_id] + rank;
         int expected_value = thread_id * 1000 + rank;
         
-        if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] Attempting to read barrier_signal_ptrs[" << thread_id << "] + " << rank << "..." << sycl::endl;
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] read_ptr = " << (void*)read_ptr << sycl::endl;
-        }
         
         // 直接读取
         int read_value = *read_ptr;
         
         bool correct = (read_value == expected_value);
         
-        if (debug_stream) {
-            *debug_stream << "[Rank " << rank << "][Thread " << thread_id 
-                         << "] READ: value=" << read_value 
-                         << " expected=" << expected_value
-                         << " " << (correct ? "CORRECT" : "MISMATCH!") << sycl::endl;
-        }
     }
     
     item.barrier(sycl::access::fence_space::local_space);
     
-    if (thread_id == 0 && debug_stream) {
-        *debug_stream << "[Rank " << rank << "] === IPC READ TEST COMPLETE ===" << sycl::endl;
-    }
 }
 
 struct alignas(16) int4 {

@@ -143,8 +143,11 @@ if __name__ == '__main__':
             
             # Add Intel GPU specific optimization flags
             # Both compile and link need the same target specification
-            sycl_compile_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
-            sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', '-device pvc'])
+            # Configurable AOT targets: set XPU_AOT_TARGETS env var (e.g. 'pvc', 'bmg', 'pvc,bmg')
+            xpu_aot_targets = os.getenv('XPU_AOT_TARGETS', 'pvc')
+            sycl_compile_args.extend(['-fsycl-targets=spir64_gen', '-Xs', f'-device {xpu_aot_targets}'])
+            sycl_link_args.extend(['-fsycl-targets=spir64_gen', '-Xs', f'-device {xpu_aot_targets}'])
+            print(f' > XPU AOT targets: {xpu_aot_targets}')
             
             # XPU sources: deep_ep.cpp and SYCL implementations
             xpu_sources = ['csrc/deep_ep.cpp', 'csrc/sycl/layout.cpp', 'csrc/sycl/intranode.cpp', 'csrc/sycl/runtime.cpp']
