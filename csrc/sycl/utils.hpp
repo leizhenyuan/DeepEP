@@ -3,6 +3,7 @@
 #include <sycl/sycl.hpp>
 #include <cstdint>
 #include <algorithm>
+#include "configs.h"
 
 namespace deep_ep {
 
@@ -243,12 +244,39 @@ inline void st_volatile_global(int64_t* addr, int64_t value) {
     );
 }
 
+// int4 bypass cache: decomposed to 4x int32
+// NOTE: defined as template to work across namespace boundaries (::int4 vs deep_ep::int4) 
+template <typename Int4T>
+inline Int4T ld_volatile_global_int4(const Int4T* addr) {
+    const int* p = reinterpret_cast<const int*>(addr);
+    Int4T result;
+    result.x = ld_volatile_global(p + 0);
+    result.y = ld_volatile_global(p + 1);
+    result.z = ld_volatile_global(p + 2);
+    result.w = ld_volatile_global(p + 3);
+    return result;
+}
+
+template <typename Int4T>
+inline void st_volatile_global_int4(Int4T* addr, Int4T value) {
+    int* p = reinterpret_cast<int*>(addr);
+    st_volatile_global(p + 0, value.x);
+    st_volatile_global(p + 1, value.y);
+    st_volatile_global(p + 2, value.z);
+    st_volatile_global(p + 3, value.w);
+}
+
 #else
 // todo: Host fallback 感觉应该添加一个runtime error
 inline int ld_volatile_global(const int* addr) { return *addr; }
 inline int64_t ld_volatile_global(const int64_t* addr) { return *addr; }
 inline void st_volatile_global(int* addr, int value) { *addr = value; }
 inline void st_volatile_global(int64_t* addr, int64_t value) { *addr = value; }
+
+template <typename Int4T>
+inline Int4T ld_volatile_global_int4(const Int4T* addr) { return *addr; }
+template <typename Int4T>
+inline void st_volatile_global_int4(Int4T* addr, Int4T value) { *addr = value; }
 #endif
 
 SYCL_EXTERNAL inline int ld_volatile_global_cas(int* ptr) {
@@ -513,17 +541,22 @@ SYCL_EXTERNAL inline void barrier_verify_kernel(int** barrier_signal_ptrs, int r
 
 
 // ============================================================================
-// barrier_block_bypass: 使用 bypass-cache load (lsc_load.ugm.uc.uc) 的 barrier
+// barrier_block_bypass: Flag-based barrier using bypass-cache load/store
 // ============================================================================
-// 算法与 CUDA 原版 barrier_block 一致：
-//   1. atomicAdd_system 到自身槽位 ptrs[rank][thread_id] += FINISHED_SUM_TAG
-//   2. atomicSub_system 到对端槽位 ptrs[thread_id][rank] -= FINISHED_SUM_TAG
-//   3. 用 bypass-cache volatile load 轮询 ptrs[rank][thread_id] 直到 <= 0
+// 协议设计：每个内存位置只有一个写者，消除并发写冲突
 //
-// 关键优势：
-//   - ld_volatile_global 使用 lsc_load.ugm.uc.uc 硬件级绕过 L1/L3 缓存，
-//     确保每次读到内存中最新值，等价于 CUDA 的 ld.volatile.global
-//   - 比 CAS-based barrier 更轻量、更接近 CUDA 原版语义
+// 布局: barrier_signal_ptrs[R][T] — 由 Rank R 独占写入，Rank T 读取
+// 语义: "Rank R 告知 Rank T 已到达 barrier"，值为单调递增的 epoch 计数
+//
+// 算法:
+//   1. Rank R 的 thread T: 读取 ptrs[rank][T] 当前值，+1 后写回（只有 rank R 写此位置）
+//   2. memory_fence_system() 确保写入对远端 GPU 可见
+//   3. Rank R 的 thread T: 轮询 ptrs[T][rank] 直到 >= 期望值（只有 rank T 写此位置）
+//
+// 正确性:
+//   - ptrs[R][T] 只有 Rank R 写入 → 无并发写，无 lost update
+//   - 值单调递增 → 多次 barrier 调用自然支持，无需 reset
+//   - 全部使用 uncached load/store → 绕过 L3，与 IPC 路径一致
 // ============================================================================
 template <int kNumRanks, bool kSyncOnly = false>
 SYCL_EXTERNAL inline void barrier_block_bypass(int** barrier_signal_ptrs, int rank,
@@ -537,15 +570,25 @@ SYCL_EXTERNAL inline void barrier_block_bypass(int** barrier_signal_ptrs, int ra
         item.barrier(sycl::access::fence_space::local_space);
     }
 
-    // Add to self slot, sub from peer slot
+    int next_epoch = 0;
+
+    // Step 1: 写入自身 slot —— ptrs[rank][thread_id] 由本 rank 独占写入
+    // 读取当前 epoch，+1 后写回，告知 rank=thread_id "我已到达 barrier"
     if (thread_id < kNumRanks) {
-        atomic_add_system(barrier_signal_ptrs[rank] + thread_id, FINISHED_SUM_TAG);
-        atomic_sub_system(barrier_signal_ptrs[thread_id] + rank, FINISHED_SUM_TAG);
+        int* my_slot = barrier_signal_ptrs[rank] + thread_id;
+        int cur_epoch = ld_volatile_global(my_slot);
+        next_epoch = cur_epoch + 1;
+        st_volatile_global(my_slot, next_epoch);
     }
 
-    // Spin-wait: 使用 bypass-cache load (lsc_load.ugm.uc.uc) 轮询
+    // 确保 flag 写入对远端 GPU 可见（通过 PCIe IPC 映射）
+    memory_fence_system();
+
+    // Step 2: 轮询对端 slot —— ptrs[thread_id][rank] 由 rank=thread_id 独占写入
+    // 等待 rank=thread_id 也到达 barrier（其 epoch >= 我们的 next_epoch）
     if (thread_id < kNumRanks) {
-        while (ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) > 0) {
+        int* peer_slot = barrier_signal_ptrs[thread_id] + rank;
+        while (ld_volatile_global(peer_slot) < next_epoch) {
             // spin — bypass cache 确保每次读到最新值
         }
     }

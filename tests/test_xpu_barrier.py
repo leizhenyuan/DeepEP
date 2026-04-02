@@ -3,8 +3,8 @@
 XPU Barrier 功能测试脚本
 
 测试命令:
-    2卡:   python test_xpu_barrier.py --num-processes 2
-    4卡:   python test_xpu_barrier.py --num-processes 4
+    2卡:   mpirun -np 2 python tests/test_xpu_barrier.py --use-mpi
+    4卡:   mpirun -np 4 python tests/test_xpu_barrier.py --use-mpi
 
 或使用 torchrun:
     torchrun --nproc_per_node=2 test_xpu_barrier.py --use-torchrun
@@ -157,14 +157,16 @@ def test_barrier_basic(
         print(f"  sync_method={'MPI' if use_mpi else 'dist.barrier'}")
         print(f"{'='*60}\n")
     
-    # 测试多次 barrier
+    # 测试多次 barrier — 模拟 notify_dispatch 中连续 3 次 barrier 的模式
     num_iterations = 1
+    num_barriers_per_iter = 100  # notify_dispatch 在单个 kernel 中调用 3 次 barrier
     for i in range(num_iterations):
-        print(f"[Rank {rank}] Barrier iteration {i + 1}/{num_iterations}...", flush=True)
+        print(f"[Rank {rank}] Barrier iteration {i + 1}/{num_iterations} "
+              f"({num_barriers_per_iter} barriers per iter)...", flush=True)
         
         # 1. CPU barrier 确保所有进程同时开始
         cpu_barrier()
-        print(f"[Rank {rank}] CPU barrier done, starting GPU barrier...", flush=True)
+        print(f"[Rank {rank}] CPU barrier done, starting GPU barriers...", flush=True)
         
         # 2. XPU 同步，确保之前的操作完成
         if hasattr(torch, 'xpu') and torch.xpu.is_available():
@@ -173,21 +175,29 @@ def test_barrier_basic(
         # 3. 再次 CPU barrier，确保所有 GPU 都同步完成
         cpu_barrier()
         
-        # 4. 调用 GPU barrier (使用 barrier_block_cas)
-        start_time = time.time()
-        try:
-            enter_time = time.time()
-            print(f"[Rank {rank}] ENTER test_barrier @ {enter_time:.6f}", flush=True)
-            buffer.runtime.test_barrier()
-            exit_time = time.time()
-            print(f"[Rank {rank}] EXIT test_barrier @ {exit_time:.6f}, duration={((exit_time - enter_time)*1000):.2f}ms", flush=True)
-            elapsed = time.time() - start_time
-            print(f"[Rank {rank}] GPU barrier completed in {elapsed*1000:.2f} ms", flush=True)
-        except Exception as e:
-            print(f"[Rank {rank}] GPU barrier FAILED: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            raise
+        # 4. 调用 GPU barrier 3 次（模拟 notify_dispatch 的 3 次 barrier_block_bypass）
+        # 第1次: barrier_block_bypass<kNumRanks, true>  (kSyncOnly=true)
+        # 第2次: barrier_block_bypass<kNumRanks>        (kSyncOnly=false, 带 memory_fence)
+        # 第3次: barrier_block_bypass<kNumRanks>        (kSyncOnly=false, 带 memory_fence)
+        for b in range(num_barriers_per_iter):
+            start_time = time.time()
+            try:
+                enter_time = time.time()
+                print(f"[Rank {rank}] ENTER test_barrier #{b+1}/{num_barriers_per_iter} "
+                      f"@ {enter_time:.6f}", flush=True)
+                buffer.runtime.test_barrier()
+                exit_time = time.time()
+                print(f"[Rank {rank}] EXIT test_barrier #{b+1}/{num_barriers_per_iter} "
+                      f"@ {exit_time:.6f}, duration={((exit_time - enter_time)*1000):.2f}ms",
+                      flush=True)
+            except Exception as e:
+                print(f"[Rank {rank}] GPU barrier #{b+1} FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                raise
+        
+        elapsed_total = time.time() - start_time
+        print(f"[Rank {rank}] All {num_barriers_per_iter} GPU barriers completed", flush=True)
         
         # 5. 再次 CPU barrier 确保所有进程都完成
         cpu_barrier()

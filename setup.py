@@ -138,7 +138,7 @@ if __name__ == '__main__':
             subprocess.run([sycl_compiler, '--version'], check=True, capture_output=True)
             print(f' > SYCL compiler: {sycl_compiler}')
             
-            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU']
+            sycl_compile_args = ['-fsycl', '-O3', '-DUSE_XPU', '-fsycl-default-sub-group-size=32']
             sycl_link_args = ['-fsycl', '-lze_loader', '-lmpi']
             
             # Add Intel GPU specific optimization flags
