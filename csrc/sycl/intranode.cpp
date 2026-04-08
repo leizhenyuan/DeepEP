@@ -218,7 +218,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      sycl::queue& stream,
                      int num_channels) {
     
-    DEBUG_LOG(rank, "notify_dispatch: START - num_ranks=" << num_ranks << ", num_tokens=" << num_tokens << ", num_experts=" << num_experts);
 
     constexpr int kNumThreads = 128;
     
@@ -232,12 +231,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
     sycl::range<1> global_range(num_blocks * kNumThreads);
     sycl::range<1> local_range(kNumThreads);
 
-    DEBUG_LOG(rank, "notify_dispatch: Launch parameters - "
-    << "num_blocks=" << num_blocks 
-    << ", kNumThreads=" << kNumThreads
-    << ", global_range=" << (num_blocks * kNumThreads)
-    << ", local_range=" << kNumThreads
-    << ", num_channels=" << num_channels);
 
     // 根据num_ranks选择模板实例
     #define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                          \
@@ -265,7 +258,6 @@ void notify_dispatch(const int* num_tokens_per_rank,
                             kernel(item);                                              \
                         });                                                            \
                 });                                                                    \
-                DEBUG_LOG(rank, "notify_dispatch: Kernel submitted for ranks=" << ranks); \
                 break;                                                                 \
         }
 
@@ -281,17 +273,13 @@ void notify_dispatch(const int* num_tokens_per_rank,
     #undef NOTIFY_DISPATCH_LAUNCH_CASE
     
     try {
-        DEBUG_LOG(rank, "notify_dispatch: Calling stream.wait()...");
         stream.wait();
     } catch (sycl::exception const& e) {
-        DEBUG_LOG(rank, "notify_dispatch: SYCL exception caught: " << e.what());
         throw;
     } catch (std::exception const& e) {
-        DEBUG_LOG(rank, "notify_dispatch: Standard exception caught: " << e.what());
         throw;
     }
     
-    DEBUG_LOG(rank, "notify_dispatch: COMPLETED");
     
 }
 
@@ -417,7 +405,8 @@ public:
         int rank,
         int num_max_send_tokens,
         int num_recv_buffer_tokens,
-        int* shared_channel_tail_idx_ptr)
+        int* shared_channel_tail_idx_ptr,
+        int* barrier_counters_ptr)
         : recv_x_(recv_x),
           recv_x_scales_(recv_x_scales),
           recv_src_idx_(recv_src_idx),
@@ -443,7 +432,8 @@ public:
           rank_(rank),
           num_max_send_tokens_(num_max_send_tokens),
           num_recv_buffer_tokens_(num_recv_buffer_tokens),
-          shared_channel_tail_idx_(shared_channel_tail_idx_ptr) {}
+          shared_channel_tail_idx_(shared_channel_tail_idx_ptr),
+          barrier_counters_(barrier_counters_ptr) {}
 
     void operator()(sycl::nd_item<1> item) const {
         const auto num_sms = static_cast<int>(item.get_group_range(0));
@@ -492,6 +482,11 @@ public:
         auto channel_x_scales_buffers = Buffer<float>(
             ptr, static_cast<int64_t>(num_channels_total) * num_recv_buffer_tokens_ * num_scales_, 
             static_cast<int64_t>(channel_rank_offset) * num_recv_buffer_tokens_ * num_scales_);
+
+        // Initialize SLM barrier counters (one per rank)
+        if (thread_id < kNumRanks)
+            barrier_counters_[thread_id] = 0;
+        sycl::group_barrier(item.get_group());
 
         if (is_sender) {
             dispatch_sender(item, num_threads_per_rank, num_channels, responsible_rank, responsible_channel,
@@ -545,6 +540,7 @@ private:
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
         const auto send_thread_id = thread_id;
         const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
+        int barrier_epoch = 0;
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
@@ -600,7 +596,7 @@ private:
                     // Copy data
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4_;
                     auto shifted_x = x_ + token_idx * hidden_int4_;
-                    UNROLLED_WARP_COPY(2, lane_id, hidden_int4_, shifted_channel_x_buffers, shifted_x, ld_nc_global, st_na_global);
+                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_channel_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
                     if (elect_one_sync(item))
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
@@ -632,9 +628,9 @@ private:
                 token_idx++;
             }
 
-            // Move tail index - use sub_group barrier instead of workgroup barrier
-            // This syncs only within the same warp/sub_group, avoiding deadlock
-            sycl::group_barrier(item.get_sub_group());
+            // Move tail index - partial barrier ensures all warps in this rank
+            // have completed their data writes before warp 0 publishes the tail
+            partial_barrier(barrier_counters_ + responsible_rank, num_send_warps_per_rank, barrier_epoch, item);
             
             if (send_warp_id_in_rank == 0 && elect_one_sync(item)) {
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
@@ -666,6 +662,7 @@ private:
         const auto recv_thread_id = thread_id;
         const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
+        int barrier_epoch = 0;
 
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs_[rank_]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank_] : 0;
@@ -703,26 +700,28 @@ private:
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         
         while (num_tokens_to_recv > 0) {
-            // Wait for new data - only the leader of each sub_group polls
-            if (lane_id == 0) {
+            // Wait for new data - only the first thread of the rank group polls
+            // and writes the result to SLM for other warps to read after barrier
+            if (recv_thread_id_in_rank == 0) {
                 int loop_count = 0;
                 while (true) {
                     cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
                     if (cached_channel_head_idx != cached_channel_tail_idx) {
+                        shared_channel_tail_idx_[responsible_rank] = cached_channel_tail_idx;
                         break;
                     }
                     loop_count++;
                     if (loop_count > 100000000) {
-                        // Set to head so we get 0 tokens and can exit
-                        cached_channel_tail_idx = cached_channel_head_idx;
+                        // Timeout: write head so all warps see 0 tokens and exit
+                        shared_channel_tail_idx_[responsible_rank] = cached_channel_head_idx;
                         break;
                     }
                 }
             }
 
-            // Use sub_group barrier and broadcast instead of workgroup barrier
-            sycl::group_barrier(item.get_sub_group());
-            cached_channel_tail_idx = sycl::group_broadcast(item.get_sub_group(), cached_channel_tail_idx, 0);
+            // Partial barrier R2: ensures all warps see the SLM tail_idx write
+            partial_barrier(barrier_counters_ + responsible_rank, num_recv_warps_per_rank, barrier_epoch, item);
+            cached_channel_tail_idx = shared_channel_tail_idx_[responsible_rank];
 
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             
@@ -736,7 +735,7 @@ private:
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens_;
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4_;
                 auto shifted_recv_x_int4 = recv_x_ + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4_;
-                UNROLLED_WARP_COPY(2, lane_id, hidden_int4_, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global, st_na_global);
             }
 
             // Copy src_idx
@@ -769,15 +768,16 @@ private:
                 }
             }
 
-            // Move queue - use sub_group barrier
+            // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            sycl::group_barrier(item.get_sub_group());
+            
+            // Partial barrier R3: ensures all warps finish copying before updating head
+            partial_barrier(barrier_counters_ + responsible_rank, num_recv_warps_per_rank, barrier_epoch, item);
             
             // Only the last warp's leader updates head_idx
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 && elect_one_sync(item)) {
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
-                // debug_stream_ << "[dispatch_receiver] rank=" << rank_ << " updated head_idx=" << cached_channel_head_idx << sycl::endl;
             }
 
             num_tokens_to_recv -= num_recv_tokens;
@@ -811,6 +811,7 @@ private:
     int num_max_send_tokens_;
     int num_recv_buffer_tokens_;
     int* shared_channel_tail_idx_;
+    int* barrier_counters_;
 };
 
 void dispatch(void* recv_x,
@@ -842,17 +843,15 @@ void dispatch(void* recv_x,
               int num_max_send_tokens,
               int num_recv_buffer_tokens) {
     
-    DEBUG_LOG(rank, "dispatch: START - num_ranks=" << num_ranks << ", num_tokens=" << num_tokens << ", num_sms=" << num_sms);
     
-    // Use 64 threads so that num_threads_per_rank=32 (1 warp), making sub_group_barrier
-    // equivalent to bar.sync for correctness verification (avoids cross-warp sync issue)
-    constexpr int kNumThreads = 64;
+    // Use 192 threads (6 warps) so that for 2 ranks we get 3 warps/rank.
+    // Cross-warp synchronization within a rank uses atomic-counter based partial_barrier.
+    constexpr int kNumThreads = 192;
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_sms % 2 == 0);
     
-    DEBUG_LOG(rank, "dispatch: Assertions passed, launching kernel...");
 
     sycl::range<1> global_range(num_sms * kNumThreads);
     sycl::range<1> local_range(kNumThreads);
@@ -860,9 +859,11 @@ void dispatch(void* recv_x,
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                     \
     case ranks:                                                                                         \
         stream.submit([&](sycl::handler& cgh) {                                                        \
-            /* Local memory for shared_channel_tail_idx */                                             \
-            sycl::local_accessor<int, 1> shared_tail_idx(sycl::range<1>(ranks), cgh);                                \
-                                                                                                                    cgh.parallel_for(                                                                          \
+            /* Local memory for shared_channel_tail_idx (receiver cross-warp communication) */          \
+            sycl::local_accessor<int, 1> shared_tail_idx(sycl::range<1>(ranks), cgh);                 \
+            /* Local memory for atomic barrier counters (one per rank) */                               \
+            sycl::local_accessor<int, 1> barrier_counters(sycl::range<1>(ranks), cgh);                \
+            cgh.parallel_for(                                                                          \
                 sycl::nd_range<1>(global_range, local_range),                                          \
                 [=](sycl::nd_item<1> item) {                                                           \
                     DispatchKernel<ranks, kNumThreads> kernel(                                         \
@@ -891,7 +892,8 @@ void dispatch(void* recv_x,
                         rank,                                                                          \
                         num_max_send_tokens,                                                           \
                         num_recv_buffer_tokens,                                                        \
-                        shared_tail_idx.get_pointer());                                                \
+                        shared_tail_idx.get_pointer(),                                                 \
+                        barrier_counters.get_pointer());                                               \
                     kernel(item);                                                                      \
                 });                                                                                    \
         });                                                                                            \
@@ -900,17 +902,15 @@ void dispatch(void* recv_x,
     switch (num_ranks) {
         DISPATCH_LAUNCH_CASE(1);
         DISPATCH_LAUNCH_CASE(2);
-        // DISPATCH_LAUNCH_CASE(4);  // Disabled: kNumThreads=64 requires >= 4 warps for rank 4
-        // DISPATCH_LAUNCH_CASE(8);  // Disabled: kNumThreads=64 requires >= 8 warps for rank 8
+        // DISPATCH_LAUNCH_CASE(4);  // TODO: enable when tested with higher kNumThreads
+        // DISPATCH_LAUNCH_CASE(8);  // TODO: enable when tested with higher kNumThreads
         default:
             EP_HOST_ASSERT(false && "Unsupported number of ranks");
     }
 
 #undef DISPATCH_LAUNCH_CASE
     
-    // DEBUG_LOG(rank, "dispatch: Kernel launched, waiting for completion...");
     stream.wait();
-    DEBUG_LOG(rank, "dispatch: COMPLETED");
 }
 
 template <int kNumRanks>
@@ -1021,9 +1021,6 @@ void cached_notify_combine(void** buffer_ptrs,
                            int num_ranks,
                            sycl::queue& stream) {
     
-    DEBUG_LOG(rank, "cached_notify_combine: START - num_channels=" << num_channels 
-              << ", num_recv_tokens=" << num_recv_tokens << ", num_memset_int=" << num_memset_int);
-
     // 计算线程数：至少128，每个rank需要32个线程（一个warp）
     const int num_threads = std::max(128, 32 * num_ranks);
     EP_HOST_ASSERT(num_ranks <= num_threads);
@@ -1068,7 +1065,6 @@ void cached_notify_combine(void** buffer_ptrs,
     #undef CACHED_NOTIFY_COMBINE_LAUNCH_CASE
     
     stream.wait();
-    DEBUG_LOG(rank, "cached_notify_combine: COMPLETED");
 }
 template <typename dtype_t, int kNumRanks, int kNumThreads>
 class CombineKernel {
@@ -1418,10 +1414,9 @@ private:
                         ? bias_1_int4[token_idx * hidden_int4 + i]
                         : make_int4(0, 0, 0, 0);
                     
-                    // 读取各rank的数据 (使用 ld_volatile_global_int4 bypass cache，避免 IGC load narrowing bug)
                     int4 recv_value_int4[kNumRanks];
                     for (int j = 0; j < num_topk_ranks; ++j) {
-                        recv_value_int4[j] = ld_volatile_global_int4(
+                        recv_value_int4[j] = ld_nc_global(
                             channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
                     }
                     
@@ -1452,32 +1447,8 @@ private:
                     
 
                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
-                    
-                    // DEBUG: print first element value for first token
-                    // if (token_idx == token_start_idx && i == lane_id && lane_id == 0) {
-                    //     auto out_bf16 = reinterpret_cast<const dtype_t*>(&out_int4);
-                    //     int dbg_base2 = 8 + responsible_channel * 4;
-                    //     recv_topk_weights_[dbg_base2 + 0] = static_cast<float>(out_bf16[0]);
-                    // }
-
-                    // Experiment: unconditional store with out_int4 data dependency
-                    // if (i == lane_id) {
-                    //     auto out_bf16 = reinterpret_cast<const dtype_t*>(&out_int4);
-                    //     recv_topk_weights_[8 + responsible_channel * 4] = static_cast<float>(out_bf16[0]);
-                    // }
-
-                    // Experiment: unconditional store, no if guard
-                    // {
-                    //     auto out_bf16 = reinterpret_cast<const dtype_t*>(&out_int4);
-                    //     recv_topk_weights_[8 + responsible_channel * 4] = static_cast<float>(out_bf16[0]);
-                    // }
-
-                    // Minimal passing fix: bf16->float + float store (inside loop)
-                    // recv_topk_weights_[8] = static_cast<float>(reinterpret_cast<const dtype_t*>(&out_int4)[0]);
-
                 }
 
-                
                 // Reduce topk_weights
                 if (lane_id < num_topk_) {
                     float value = 0;
@@ -1559,11 +1530,6 @@ void combine(std::nullptr_t type,
     sycl::range<1> global_range(num_sms * kNumThreads);
     sycl::range<1> local_range(kNumThreads);
     
-    DEBUG_LOG(rank, "combine: Launching kernel with "
-              << "num_sms=" << num_sms
-              << ", kNumThreads=" << kNumThreads
-              << ", num_recv_tokens=" << num_recv_tokens
-              << ", num_max_send_tokens=" << num_max_send_tokens);
     
     // 根据num_ranks选择模板实例
     #define COMBINE_LAUNCH_CASE(ranks)                                                      \
@@ -1605,7 +1571,6 @@ void combine(std::nullptr_t type,
                                warp_retired_acc.get_pointer());                           \
                     });                                                                    \
             });                                                                            \
-            DEBUG_LOG(rank, "combine: Kernel submitted for ranks=" << ranks);             \
             break;                                                                         \
         }
     
@@ -1621,17 +1586,13 @@ void combine(std::nullptr_t type,
     #undef COMBINE_LAUNCH_CASE
     
     try {
-        DEBUG_LOG(rank, "combine: Calling stream.wait()...");
         stream.wait();
     } catch (sycl::exception const& e) {
-        DEBUG_LOG(rank, "combine: SYCL exception caught: " << e.what());
         throw;
     } catch (std::exception const& e) {
-        DEBUG_LOG(rank, "combine: Standard exception caught: " << e.what());
         throw;
     }
     
-    DEBUG_LOG(rank, "combine: COMPLETED");
 }
 
 // ============================================================================
@@ -1661,7 +1622,6 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& st
     sycl::range<1> global_range(kNumThreads);
     sycl::range<1> local_range(kNumThreads);
 
-    DEBUG_LOG(rank, "barrier: START - num_ranks=" << num_ranks);
 
     #define BARRIER_LAUNCH_CASE(ranks)                                              \
         case ranks: {                                                               \
@@ -1676,9 +1636,7 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& st
                             kernel(item);                                          \
                         });                                                        \
                 });                                                                \
-                DEBUG_LOG(rank, "barrier: Kernel submitted for ranks=" << ranks); \
             } catch (sycl::exception const& e) {                                   \
-                DEBUG_LOG(rank, "barrier: SYCL exception: " << e.what());         \
                 throw;                                                             \
             }                                                                      \
             break;                                                                 \
@@ -1696,7 +1654,6 @@ void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& st
     #undef BARRIER_LAUNCH_CASE
     
     stream.wait();
-    DEBUG_LOG(rank, "barrier: COMPLETED");
 }
 
 // ============================================================================
@@ -1726,8 +1683,6 @@ void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::qu
     sycl::range<1> global_range(kNumThreads);
     sycl::range<1> local_range(kNumThreads);
 
-    DEBUG_LOG(rank, "ipc_test_write: START - num_ranks=" << num_ranks);
-
     #define IPC_WRITE_LAUNCH_CASE(ranks)                                            \
         case ranks: {                                                               \
             try {                                                                   \
@@ -1742,9 +1697,7 @@ void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::qu
                         });                                                        \
                 });                                                                \
                 stream.wait();                                                     \
-                DEBUG_LOG(rank, "ipc_test_write: Kernel completed for ranks=" << ranks); \
             } catch (sycl::exception const& e) {                                   \
-                DEBUG_LOG(rank, "ipc_test_write: SYCL exception: " << e.what());  \
                 throw;                                                             \
             }                                                                      \
             break;                                                                 \
@@ -1761,7 +1714,6 @@ void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::qu
 
     #undef IPC_WRITE_LAUNCH_CASE
     
-    DEBUG_LOG(rank, "ipc_test_write: COMPLETED");
 }
 
 // ============================================================================
@@ -1791,8 +1743,6 @@ void ipc_test_read(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::que
     sycl::range<1> global_range(kNumThreads);
     sycl::range<1> local_range(kNumThreads);
 
-    DEBUG_LOG(rank, "ipc_test_read: START - num_ranks=" << num_ranks);
-
     #define IPC_READ_LAUNCH_CASE(ranks)                                             \
         case ranks: {                                                               \
             try {                                                                   \
@@ -1807,9 +1757,7 @@ void ipc_test_read(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::que
                         });                                                        \
                 });                                                                \
                 stream.wait();                                                     \
-                DEBUG_LOG(rank, "ipc_test_read: Kernel completed for ranks=" << ranks); \
             } catch (sycl::exception const& e) {                                   \
-                DEBUG_LOG(rank, "ipc_test_read: SYCL exception: " << e.what());   \
                 throw;                                                             \
             }                                                                      \
             break;                                                                 \
@@ -1825,8 +1773,143 @@ void ipc_test_read(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::que
     }
 
     #undef IPC_READ_LAUNCH_CASE
-    
-    DEBUG_LOG(rank, "ipc_test_read: COMPLETED");
+}
+
+// ============================================================================
+// Barrier Stress Test Kernel — correctness mode
+// write → barrier → read+verify → barrier, repeated inner_repeat times
+// ============================================================================
+
+template <int kNumRanks>
+class BarrierStressTestKernel {
+public:
+    BarrierStressTestKernel(
+        void** buffer_ptrs,
+        int** barrier_signal_ptrs,
+        int* error_count,
+        int rank,
+        int inner_repeat,
+        int iter_offset,
+        int data_size,
+        int data_offset_ints)
+        : buffer_ptrs_(buffer_ptrs),
+          barrier_signal_ptrs_(barrier_signal_ptrs),
+          error_count_(error_count),
+          rank_(rank),
+          inner_repeat_(inner_repeat),
+          iter_offset_(iter_offset),
+          data_size_(data_size),
+          data_offset_ints_(data_offset_ints) {}
+
+    void operator()(sycl::nd_item<1> item) const {
+        auto thread_id = static_cast<int>(item.get_local_id(0));
+        auto num_threads = static_cast<int>(item.get_local_range(0));
+
+        for (int i = 0; i < inner_repeat_; ++i) {
+            int iter = iter_offset_ + i;
+
+            // Step 1: WRITE — each rank writes to its own IPC data buffer
+            int* my_data = reinterpret_cast<int*>(
+                static_cast<uint8_t*>(buffer_ptrs_[rank_])) + data_offset_ints_;
+            for (int j = thread_id; j < data_size_; j += num_threads) {
+                int encoded = iter * 10000 + rank_ * 100 + (j % 100);
+                st_volatile_global(my_data + j, encoded);
+            }
+
+            // Step 2: Fence data writes, then BARRIER
+            memory_fence_system();
+            item.barrier(sycl::access::fence_space::local_space);
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item);
+
+            // Step 3: READ + VERIFY — read all peers' data
+            int local_errors = 0;
+            for (int p = 0; p < kNumRanks; ++p) {
+                if (p == rank_) continue;
+                int* peer_data = reinterpret_cast<int*>(
+                    static_cast<uint8_t*>(buffer_ptrs_[p])) + data_offset_ints_;
+                for (int j = thread_id; j < data_size_; j += num_threads) {
+                    int expected = iter * 10000 + p * 100 + (j % 100);
+                    int actual = ld_volatile_global(peer_data + j);
+                    if (actual != expected) {
+                        local_errors++;
+                    }
+                }
+            }
+            if (local_errors > 0) {
+                atomic_add_system(error_count_, local_errors);
+            }
+
+            // Step 4: BARRIER — ensure all reads done before next write
+            barrier_block_bypass<kNumRanks, true>(barrier_signal_ptrs_, rank_, item);
+        }
+    }
+
+private:
+    void** buffer_ptrs_;
+    int** barrier_signal_ptrs_;
+    int* error_count_;
+    int rank_;
+    int inner_repeat_;
+    int iter_offset_;
+    int data_size_;
+    int data_offset_ints_;
+};
+
+void barrier_stress_test(void** buffer_ptrs,
+                         int** barrier_signal_ptrs,
+                         int* error_count,
+                         int rank, int num_ranks,
+                         int inner_repeat, int iter_offset,
+                         int data_size, int data_offset_ints,
+                         sycl::queue& stream) {
+    constexpr int kNumThreads = 128;
+
+    sycl::range<1> global_range(kNumThreads);
+    sycl::range<1> local_range(kNumThreads);
+
+    #define STRESS_LAUNCH_CASE(ranks)                                               \
+        case ranks: {                                                               \
+            stream.submit([&](sycl::handler& cgh) {                                \
+                cgh.parallel_for(                                                  \
+                    sycl::nd_range<1>(global_range, local_range),                  \
+                    [=](sycl::nd_item<1> item) {                                   \
+                        BarrierStressTestKernel<ranks> kernel(                     \
+                            buffer_ptrs, barrier_signal_ptrs,                      \
+                            error_count, rank,                                     \
+                            inner_repeat, iter_offset,                             \
+                            data_size, data_offset_ints);                          \
+                        kernel(item);                                              \
+                    });                                                            \
+            });                                                                    \
+            break;                                                                 \
+        }
+
+    switch (num_ranks) {
+        STRESS_LAUNCH_CASE(2);
+        STRESS_LAUNCH_CASE(4);
+        STRESS_LAUNCH_CASE(8);
+        default:
+            EP_HOST_ASSERT(false && "Unsupported number of ranks for stress test");
+    }
+
+    #undef STRESS_LAUNCH_CASE
+
+    stream.wait();
+}
+
+// ============================================================================
+// Barrier Stress Test — perf mode (pure barrier, no data)
+// Directly calls the proven barrier() function in a loop.
+// Each call does submit + stream.wait(), matching test_xpu_barrier.py behavior.
+// ============================================================================
+
+void barrier_perf_test(int** barrier_signal_ptrs,
+                       int rank, int num_ranks,
+                       int inner_repeat,
+                       sycl::queue& stream) {
+    for (int i = 0; i < inner_repeat; ++i) {
+        barrier(barrier_signal_ptrs, rank, num_ranks, stream);
+    }
 }
 
 }  // namespace intranode

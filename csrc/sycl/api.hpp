@@ -136,6 +136,19 @@ void ipc_test_write(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::qu
 
 void ipc_test_read(int** barrier_signal_ptrs, int rank, int num_ranks, sycl::queue& stream);
 
+void barrier_stress_test(void** buffer_ptrs,
+                         int** barrier_signal_ptrs,
+                         int* error_count,
+                         int rank, int num_ranks,
+                         int inner_repeat, int iter_offset,
+                         int data_size, int data_offset_ints,
+                         sycl::queue& stream);
+
+void barrier_perf_test(int** barrier_signal_ptrs,
+                       int rank, int num_ranks,
+                       int inner_repeat,
+                       sycl::queue& stream);
+
 }  // namespace intranode
 
 }  // namespace deep_ep

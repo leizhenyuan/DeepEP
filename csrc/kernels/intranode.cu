@@ -831,6 +831,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
                 while (true) {
                     // 由于不同的warp 负责的是不同的rank，所以这里需要让每个warp去检查slot是否有空位
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                    // load volatile global 编译器无法重排或者删除合并之类的优化，并且bypass l1
                     int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
                     if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
                         break;
@@ -868,6 +869,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
+            // ok 这个地方其实是一个round/max_token_chunk发送完成之后 issue 一次flag
             asm volatile("bar.sync %0, %1;" ::"r"(send_rank_id), "r"(num_threads_per_rank));
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
@@ -883,7 +885,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(
         // Shared head, tail and retired flags for receiver warps
         // Warp w 在 Rank r 的 buffer 中消费到的位置
         // 消费者的 head idx，每个warp维护一份，每个warp是copy的最小单位
-        // recv 阶段每个warp 居然要看到所有的rank，这个还挺意外的
+        // recv 阶段每个warp 要看到所有的rank，每个warp负责一个token，但是这个token的来源可以是所有rank
         __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks];
         // 每个rank的 tail idx，由生产者决定所有warp 看到的应该是一致的，所以只需要kNumRanks个
         __shared__ volatile int channel_tail_idx[kNumRanks];

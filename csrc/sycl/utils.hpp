@@ -114,6 +114,41 @@ SYCL_EXTERNAL inline void memory_fence_workgroup() {
     sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group);
 }
 
+// Atomic-counter based partial barrier for synchronizing a subset of warps
+// within a work-group (replaces CUDA's bar.sync named barrier).
+// Uses monotonically increasing expected count — no reset needed between iterations.
+//
+// barrier_counter: SLM pointer (one int per rank group, initialized to 0)
+// num_warps: number of warps that must arrive before any can proceed
+// barrier_epoch: per-warp mutable counter, starts at 0, incremented each call
+SYCL_EXTERNAL inline void partial_barrier(
+    int* barrier_counter,
+    int num_warps,
+    int& barrier_epoch,
+    sycl::nd_item<1>& item
+) {
+    // Ensure prior writes (including IPC) are globally visible
+    sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
+
+    // Arrive: lane 0 of this sub-group increments the counter
+    auto ref = sycl::atomic_ref<int,
+        sycl::memory_order::acq_rel,
+        sycl::memory_scope::work_group,
+        sycl::access::address_space::local_space>(*barrier_counter);
+    if (elect_one_sync(item)) {
+        ref.fetch_add(1);
+    }
+    sycl::group_barrier(item.get_sub_group());
+
+    // Wait for all participating warps to arrive
+    barrier_epoch++;
+    int expected = barrier_epoch * num_warps;
+    if (elect_one_sync(item)) {
+        while (ref.load() < expected) {}
+    }
+    sycl::group_barrier(item.get_sub_group());
+}
+
 // todo: 或许这里可以考虑更轻量化的ordering
 SYCL_EXTERNAL inline int atomic_add_system(int* ptr, int value) {
     auto atomic_ref = sycl::atomic_ref<int, 

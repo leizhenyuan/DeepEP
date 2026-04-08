@@ -2222,6 +2222,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("test_barrier", &deep_ep::Buffer::test_barrier,
              py::arg("process_group") = std::nullopt,
              "Test barrier synchronization across GPUs. Optionally provide a ProcessGroup for CPU barriers.")
+        .def("test_barrier_stress", &deep_ep::Buffer::test_barrier_stress,
+             py::arg("inner_repeat"),
+             py::arg("iter_offset"),
+             py::arg("data_size"),
+             "Barrier stress test with IPC data verification. Returns error count.")
+        .def("test_barrier_perf", &deep_ep::Buffer::test_barrier_perf,
+             py::arg("inner_repeat"),
+             "Pure barrier performance test (no data verification).")
         .def("test_notify_dispatch", &deep_ep::Buffer::test_notify_dispatch,
              py::arg("num_tokens_per_rank"),
              py::arg("num_tokens_per_expert"),
@@ -2456,8 +2464,8 @@ deep_ep::Buffer::intranode_dispatch(const torch::Tensor& x,
 
         std::cout << "[XPU] notify_dispatch done." << std::endl;
 
-        // Synchronize to ensure kernel completes
-        comm_stream.wait();
+        // W1 inside notify_dispatch already synchronizes the queue,
+        // so no extra comm_stream.wait() needed here.
 
         if (num_worst_tokens > 0) {
             std::cout << "[XPU] num_worst_tokens > 0" << std::endl;
@@ -3057,6 +3065,49 @@ void deep_ep::Buffer::test_barrier(const std::optional<c10::intrusive_ptr<c10d::
     
     std::cout << "[test_barrier] Rank " << nvl_rank 
               << ": Barrier test completed." << std::endl;
+}
+
+int deep_ep::Buffer::test_barrier_stress(int inner_repeat, int iter_offset, int data_size) {
+    EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_barrier_stress");
+    EP_HOST_ASSERT(data_size > 0 && "data_size must be positive");
+
+    // Use the tail of the NVL data buffer for stress test data
+    // data_offset_ints is the int-offset from the start of each rank's buffer
+    int data_bytes = data_size * sizeof(int);
+    EP_HOST_ASSERT(data_bytes <= num_nvl_bytes && "data_size too large for NVL buffer");
+    int data_offset_ints = static_cast<int>((num_nvl_bytes - data_bytes) / sizeof(int));
+
+    // Allocate error_count on device (single int, zeroed)
+    int* error_count_dev = nullptr;
+    error_count_dev = sycl::malloc_device<int>(1, comm_stream);
+    comm_stream.memset(error_count_dev, 0, sizeof(int)).wait();
+
+    // Launch kernel
+    intranode::barrier_stress_test(
+        buffer_ptrs_gpu, barrier_signal_ptrs_gpu,
+        error_count_dev,
+        nvl_rank, num_nvl_ranks,
+        inner_repeat, iter_offset,
+        data_size, data_offset_ints,
+        comm_stream);
+
+    // Copy error count back
+    int error_count = 0;
+    comm_stream.memcpy(&error_count, error_count_dev, sizeof(int)).wait();
+    sycl::free(error_count_dev, comm_stream);
+
+    return error_count;
+}
+
+void deep_ep::Buffer::test_barrier_perf(int inner_repeat) {
+    EP_HOST_ASSERT(is_available() && "Buffer must be synced before calling test_barrier_perf");
+    EP_HOST_ASSERT(inner_repeat > 0 && "inner_repeat must be positive");
+
+    intranode::barrier_perf_test(
+        barrier_signal_ptrs_gpu,
+        nvl_rank, num_nvl_ranks,
+        inner_repeat,
+        comm_stream);
 }
 
 std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> 

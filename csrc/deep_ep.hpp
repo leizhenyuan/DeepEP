@@ -358,6 +358,13 @@ public:
     // process_group: 可选的 PyTorch 分布式 process group，用于 CPU barrier 同步
     void test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group = std::nullopt);
     
+    // test_barrier_stress: barrier + IPC data verification stress test
+    // Returns error_count (0 = all passed)
+    int test_barrier_stress(int inner_repeat, int iter_offset, int data_size);
+
+    // test_barrier_perf: pure barrier performance test (no data verification)
+    void test_barrier_perf(int inner_repeat);
+    
     // test_notify_dispatch: 直接测试 notify_dispatch 内核
     // 返回: (moe_recv_count, expert_counts, rank_prefix_matrix, channel_prefix_matrix)
     std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> test_notify_dispatch(
