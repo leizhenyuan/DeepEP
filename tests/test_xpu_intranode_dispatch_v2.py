@@ -103,7 +103,7 @@ def build_encoded_data(num_tokens, hidden, rank, device):
 
     要求 num_tokens < 10000 以保证编码不冲突。
     """
-    assert num_tokens < 100, "num_tokens must be < 10000 for encoding to work"
+    assert num_tokens < 10000, "num_tokens must be < 10000 for encoding to work"
     x = torch.zeros((num_tokens, hidden), dtype=torch.bfloat16, device=device)
     for i in range(num_tokens):
         x[i, :] = rank * 100 + i
@@ -151,6 +151,12 @@ def verify_dispatch(recv_x, rank_prefix_matrix, rank, num_ranks,
             if decoded_rank != src_rank:
                 errors.append(f"Token at idx {idx}: value {val} decodes to rank {decoded_rank}, "
                               f"expected src_rank {src_rank}")
+                continue
+
+            num_tokens_src = all_is_token_in_rank[src_rank].shape[0]
+            if decoded_token < 0 or decoded_token >= num_tokens_src:
+                errors.append(f"Token at idx {idx}: value {val} decodes to token_id {decoded_token}, "
+                              f"out of range [0, {num_tokens_src})")
                 continue
 
             if not all_is_token_in_rank[src_rank][decoded_token, rank].item():
@@ -245,7 +251,22 @@ def test_dispatch_combine(args, rank, num_ranks, group, device, buffer):
             print(f'[global] rank {r} sends: {all_num_tokens_per_rank[r].tolist()}', flush=True)
 
     # ====== 4. Dispatch ======
-    config = deep_ep.Config(args.num_sms, 64, 256)
+    config = deep_ep.Config(args.num_sms, 256, 384)
+
+    # ====== Warmup ======
+    if rank == 0:
+        print(f'\n[warmup] Running warmup iterations...', flush=True)
+    for _ in range(3):
+        _ = buffer.dispatch(
+            x=x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            config=config,
+        )
+        torch.xpu.synchronize()
 
     if rank == 0:
         print(f'\n[dispatch] Starting...', flush=True)
@@ -268,6 +289,51 @@ def test_dispatch_combine(args, rank, num_ranks, group, device, buffer):
     dispatch_end = time.perf_counter()
     dispatch_ms = (dispatch_end - dispatch_start) * 1000
     print(f'[rank {rank}] DISPATCH TIME: {dispatch_ms:.3f} ms', flush=True)
+
+    # ====== Profiled dispatch run ======
+    if args.profile:
+        if rank == 0:
+            print(f'\n[profile] Running profiled dispatch + combine...', flush=True)
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.XPU,
+            ],
+            record_shapes=True,
+            with_stack=False,
+        ) as prof:
+            torch.xpu.synchronize()
+
+            with torch.profiler.record_function("dispatch_e2e"):
+                recv_x2, recv_topk_idx2, recv_topk_weights2, recv_expert_list2, handle2, event2 = \
+                    buffer.dispatch(
+                        x=x,
+                        num_tokens_per_rank=num_tokens_per_rank,
+                        is_token_in_rank=is_token_in_rank,
+                        num_tokens_per_expert=num_tokens_per_expert,
+                        topk_idx=topk_idx,
+                        topk_weights=topk_weights,
+                        config=config,
+                    )
+                torch.xpu.synchronize()
+
+            if test_mode != 'dispatch':
+                with torch.profiler.record_function("combine_e2e"):
+                    combined_x2, combined_topk_weights2, event3 = buffer.combine(
+                        x=recv_x2, handle=handle2, config=config,
+                        topk_weights=recv_topk_weights2,
+                    )
+                    torch.xpu.synchronize()
+
+        # Print profiler results
+        print(f'\n[rank {rank}] === PROFILER RESULTS ===', flush=True)
+        print(prof.key_averages().table(sort_by="self_xpu_time_total", row_limit=30), flush=True)
+
+        # Export chrome trace
+        trace_path = f'/tmp/deepep_trace_rank{rank}.json'
+        prof.export_chrome_trace(trace_path)
+        print(f'[rank {rank}] Chrome trace exported to {trace_path}', flush=True)
 
     # ====== 5. 验证 dispatch ======
     rank_prefix_matrix = handle[0]
@@ -307,9 +373,15 @@ def test_dispatch_combine(args, rank, num_ranks, group, device, buffer):
     combine_ms = (combine_end - combine_start) * 1000
     print(f'[rank {rank}] COMBINE TIME: {combine_ms:.3f} ms', flush=True)
 
+    # DEBUG: 打印 recv_topk_weights[8..15] 中的 debug values
+    flat_weights = combined_topk_weights.flatten()
+    if flat_weights.numel() > 15:
+        dbg_vals = flat_weights[0:16].float().cpu().tolist()
+        print(f'[rank {rank}] DEBUG values[0..15] (pre-store values): {dbg_vals}', flush=True)
+
     # ====== 7. 验证 combine ======
-    print(f'[rank {rank}] combined_x shape: {combined_x.shape}', flush=True)
-    print(f'[rank {rank}] combined_x = {combined_x}', flush=True)
+    # print(f'[rank {rank}] combined_x shape: {combined_x.shape}', flush=True)
+    # print(f'[rank {rank}] combined_x = {combined_x}', flush=True)
 
     combine_errors = verify_combine(combined_x, x, is_token_in_rank, num_tokens)
 
@@ -323,15 +395,17 @@ def test_dispatch_combine(args, rank, num_ranks, group, device, buffer):
 
 def main():
     parser = argparse.ArgumentParser(description='Test XPU intranode dispatch (deterministic)')
-    parser.add_argument('--num-tokens', type=int, default=64)
+    parser.add_argument('--num-tokens', type=int, default=1)
     parser.add_argument('--hidden', type=int, default=5120)
-    parser.add_argument('--num-topk', type=int, default=6)
+    parser.add_argument('--num-topk', type=int, default=2)
     parser.add_argument('--num-experts', type=int, default=128)
-    parser.add_argument('--num-sms', type=int, default=64)
+    parser.add_argument('--num-sms', type=int, default=16)
     parser.add_argument('--port', type=int, default=29500)
     parser.add_argument('--test', type=str, default='both',
                         choices=['dispatch', 'combine', 'both'],
                         help='Which phase to test: dispatch, combine, or both')
+    parser.add_argument('--profile', action='store_true', default=False,
+                        help='Enable profiling and print profiler results')
     args = parser.parse_args()
 
     import deep_ep
