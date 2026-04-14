@@ -631,37 +631,6 @@ void Buffer::sync(const std::vector<int>& device_ids,
 }
 #endif
 
-#ifdef USE_XPU
-#include "csrc/sycl/layout.hpp"
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
-Buffer::get_dispatch_layout(    
-    const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
-    EP_HOST_ASSERT(topk_idx.dim() == 2);
-    EP_HOST_ASSERT(topk_idx.is_contiguous());
-    EP_HOST_ASSERT(num_experts > 0);
-
-    //todo：event overlapping
-    auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
-    auto num_tokens_per_rank = torch::empty({num_ranks}, dtype(torch::kInt32).device(torch::kXPU));
-    auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
-    auto num_tokens_per_expert = torch::empty({num_experts}, dtype(torch::kInt32).device(torch::kXPU));
-    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, dtype(torch::kBool).device(torch::kXPU));
-    if (is_internode_available())
-        num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kXPU));
-    layout::get_dispatch_layout(topk_idx.data_ptr<topk_idx_t>(),
-                                num_tokens_per_rank.data_ptr<int>(),
-                                num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
-                                num_tokens_per_expert.data_ptr<int>(),
-                                is_token_in_rank.data_ptr<bool>(),
-                                num_tokens,
-                                num_topk,
-                                num_ranks,
-                                num_experts,
-                                comm_stream);
-    return {num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, event};
-}
-#endif
-
 #ifdef USE_CUDA
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(
@@ -2697,16 +2666,32 @@ deep_ep::Buffer::intranode_combine(const torch::Tensor& x,
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<deep_ep::EventHandle>>
-deep_ep::Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, 
-                                     int num_experts, 
-                                     std::optional<deep_ep::EventHandle>& previous_event, 
-                                     bool async, 
+deep_ep::Buffer::get_dispatch_layout(const torch::Tensor& topk_idx,
+                                     int num_experts,
+                                     std::optional<deep_ep::EventHandle>& previous_event,
+                                     bool async,
                                      bool allocate_on_comm_stream) {
-    // XPU stub - TODO: implement XPU get_dispatch_layout
-    auto num_tokens = static_cast<int>(topk_idx.size(0));
-    auto dummy_int_tensor = torch::zeros({num_ranks}, torch::kInt32);
-    auto dummy_bool_tensor = torch::zeros({num_tokens, num_ranks}, torch::kBool);
-    return std::make_tuple(dummy_int_tensor, std::nullopt, dummy_int_tensor, dummy_bool_tensor, std::nullopt);
+    EP_HOST_ASSERT(topk_idx.dim() == 2);
+    EP_HOST_ASSERT(topk_idx.is_contiguous());
+    EP_HOST_ASSERT(num_experts > 0);
+
+    auto num_tokens = static_cast<int>(topk_idx.size(0)), num_topk = static_cast<int>(topk_idx.size(1));
+    auto num_tokens_per_rank = torch::empty({num_ranks}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto num_tokens_per_rdma_rank = std::optional<torch::Tensor>();
+    auto num_tokens_per_expert = torch::empty({num_experts}, torch::dtype(torch::kInt32).device(torch::kXPU));
+    auto is_token_in_rank = torch::empty({num_tokens, num_ranks}, torch::dtype(torch::kBool).device(torch::kXPU));
+
+    deep_ep::layout::get_dispatch_layout(topk_idx.data_ptr<deep_ep::topk_idx_t>(),
+                                num_tokens_per_rank.data_ptr<int>(),
+                                nullptr,
+                                num_tokens_per_expert.data_ptr<int>(),
+                                is_token_in_rank.data_ptr<bool>(),
+                                num_tokens,
+                                num_topk,
+                                num_ranks,
+                                num_experts,
+                                comm_stream);
+    return std::make_tuple(num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, std::nullopt);
 }
 
 sycl::queue deep_ep::Buffer::get_comm_queue() const {

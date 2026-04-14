@@ -35,7 +35,7 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
                          int num_topk,
                          int num_ranks,
                          int num_experts,
-                         deep_ep::StreamType stream);
+                         deep_ep::StreamType& stream);
 
 }  // namespace layout
 

@@ -444,10 +444,9 @@ public:
         // 偶数sm负责发送，奇数sm负责接收，每两个sm负责一个channel
         const bool is_sender = sm_id % 2 == 0;
 
-        // Several warps are responsible for a single rank
-        const auto num_threads_per_rank = kNumThreads / kNumRanks;
+        // Exactly one warp per rank (kNumThreads == kNumRanks * 32)
         const auto num_channels = num_sms / 2;
-        const auto responsible_rank = thread_id / num_threads_per_rank;
+        const auto responsible_rank = thread_id / 32;
         const auto responsible_channel = sm_id / 2;
 
         int num_experts_per_rank = num_experts_ / kNumRanks;
@@ -483,42 +482,23 @@ public:
             ptr, static_cast<int64_t>(num_channels_total) * num_recv_buffer_tokens_ * num_scales_, 
             static_cast<int64_t>(channel_rank_offset) * num_recv_buffer_tokens_ * num_scales_);
 
-        // Initialize SLM barrier counters (one per rank)
-        if (thread_id < kNumRanks)
-            barrier_counters_[thread_id] = 0;
-        sycl::group_barrier(item.get_group());
-
         if (is_sender) {
-            dispatch_sender(item, num_threads_per_rank, num_channels, responsible_rank, responsible_channel,
+            dispatch_sender(item, sm_id, num_channels, responsible_rank, responsible_channel,
                            num_experts_per_rank, channel_start_offset, channel_end_offset, channel_head_idx,
                            channel_tail_idx, channel_x_buffers, channel_src_idx_buffers, channel_topk_idx_buffers,
                            channel_topk_weights_buffers, channel_x_scales_buffers);
         } else {
-            dispatch_receiver(item, num_threads_per_rank, num_channels, responsible_rank, responsible_channel,
+            dispatch_receiver(item, sm_id, num_channels, responsible_rank, responsible_channel,
                              channel_start_offset, channel_end_offset, channel_head_idx, channel_tail_idx,
                              channel_x_buffers, channel_src_idx_buffers, channel_topk_idx_buffers,
                              channel_topk_weights_buffers, channel_x_scales_buffers);
         }
-
-
-        /* ==================== STEP 3: Clean recv_topk_idx (最后解除) ====================
-        // Clean unused `recv_topk_idx` as -1
-        if (num_worst_tokens_ > 0 && recv_topk_idx_ != nullptr) {
-            auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs_[rank_]);
-            const auto num_recv_tokens = rank_prefix_matrix[(kNumRanks - 1) * kNumRanks + rank_];
-            const auto clean_start = num_recv_tokens * num_topk_ + sm_id * kNumThreads;
-            const auto clean_end = num_worst_tokens_ * num_topk_;
-            const auto clean_stride = num_sms * kNumThreads;
-            for (int i = clean_start + thread_id; i < clean_end; i += clean_stride)
-                recv_topk_idx_[i] = -1;
-        }
-        ==================== END STEP 3 ==================== */
     }
 
 private:
     void dispatch_sender(
         sycl::nd_item<1> item,
-        int num_threads_per_rank,
+        int sm_id,
         int num_channels,
         int responsible_rank,
         int responsible_channel,
@@ -533,24 +513,17 @@ private:
         Buffer<float>& channel_topk_weights_buffers,
         Buffer<float>& channel_x_scales_buffers) const {
         
-        const auto thread_id = static_cast<int>(item.get_local_id(0));
         const auto lane_id = get_lane_id(item);
-        
-        constexpr int num_send_warps = kNumThreads / 32;
-        constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
-        const auto send_thread_id = thread_id;
-        const auto send_warp_id_in_rank = send_thread_id % num_threads_per_rank / 32;
-        int barrier_epoch = 0;
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
-        if (send_warp_id_in_rank == 0 && elect_one_sync(item)) {
+        if (elect_one_sync(item)) {
             int value = responsible_channel > 0 ? 
                 channel_prefix_matrix_[responsible_rank * num_channels + responsible_channel - 1] : 0;
-            st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
+            st_volatile_global(channel_start_offset.buffer(), -value - 1);
             
             value = channel_prefix_matrix_[responsible_rank * num_channels + responsible_channel];
-            st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
+            st_volatile_global(channel_end_offset.buffer(), -value - 1);
         }
         sycl::group_barrier(item.get_sub_group());
 
@@ -562,15 +535,14 @@ private:
             // Check destination queue emptiness
             if (elect_one_sync(item)) {
                 int loop_count = 0;
-                int head_idx_value = 0;
                 while (true) {
-                    head_idx_value = ld_volatile_global(channel_head_idx.buffer());
+                    int head_idx_value = ld_volatile_global(channel_head_idx.buffer());
                     int num_used_slots = cached_channel_tail_idx - head_idx_value;
                     if (num_recv_buffer_tokens_ - num_used_slots >= num_max_send_tokens_) {
                         break;
                     }
                     loop_count++;
-                    if (loop_count > 100000000) {
+                    if (loop_count > 1000000) {
                         break;
                     }
                 }
@@ -580,7 +552,7 @@ private:
             int chunk_token_idx = 0;
             while (chunk_token_idx < num_max_send_tokens_ && token_idx < token_end_idx) {
                 // Record send_head
-                if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank && elect_one_sync(item))
+                if (elect_one_sync(item))
                     send_head_[token_idx * kNumRanks + responsible_rank] =
                         is_token_in_rank_[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
 
@@ -592,35 +564,34 @@ private:
 
                 // Get an empty slot
                 int dst_slot_idx = (cached_channel_tail_idx++) % num_recv_buffer_tokens_;
-                if (cached_channel_tail_idx % num_send_warps_per_rank == send_warp_id_in_rank) {
-                    // Copy data
-                    auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4_;
-                    auto shifted_x = x_ + token_idx * hidden_int4_;
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_channel_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
-                    if (elect_one_sync(item))
-                        channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
+                // Copy data
+                auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4_;
+                auto shifted_x = x_ + token_idx * hidden_int4_;
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_channel_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
-                    // Copy topk_idx and topk_weights
-                    if (topk_idx_ != nullptr && lane_id < num_topk_) {
-                        int recv_expert_begin = responsible_rank * num_experts_per_rank;
-                        int recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
-                        auto idx_value = topk_idx_[token_idx * num_topk_ + lane_id];
-                        idx_value = (idx_value >= recv_expert_begin && idx_value < recv_expert_end) ? 
-                                   idx_value - recv_expert_begin : -1;
-                        channel_topk_idx_buffers[dst_slot_idx * num_topk_ + lane_id] = idx_value;
+                if (elect_one_sync(item))
+                    st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
 
-                        auto weight_value = topk_weights_[token_idx * num_topk_ + lane_id];
-                        weight_value = (idx_value >= 0) ? weight_value : 0.0f;
-                        channel_topk_weights_buffers[dst_slot_idx * num_topk_ + lane_id] = weight_value;
-                    }
+                // Copy topk_idx and topk_weights
+                if (topk_idx_ != nullptr && lane_id < num_topk_) {
+                    int recv_expert_begin = responsible_rank * num_experts_per_rank;
+                    int recv_expert_end = (responsible_rank + 1) * num_experts_per_rank;
+                    auto idx_value = topk_idx_[token_idx * num_topk_ + lane_id];
+                    idx_value = (idx_value >= recv_expert_begin && idx_value < recv_expert_end) ? 
+                               idx_value - recv_expert_begin : -1;
+                    st_na_global(channel_topk_idx_buffers.buffer() + dst_slot_idx * num_topk_ + lane_id, idx_value);
 
-                    // Copy x_scales
-                    if (x_scales_ != nullptr) {
-                        for (int i = lane_id; i < num_scales_; i += 32) {
-                            auto offset = token_idx * scale_token_stride_ + i * scale_hidden_stride_;
-                            channel_x_scales_buffers[dst_slot_idx * num_scales_ + i] = x_scales_[offset];
-                        }
+                    auto weight_value = topk_weights_[token_idx * num_topk_ + lane_id];
+                    weight_value = (idx_value >= 0) ? weight_value : 0.0f;
+                    st_na_global(channel_topk_weights_buffers.buffer() + dst_slot_idx * num_topk_ + lane_id, weight_value);
+                }
+
+                // Copy x_scales
+                if (x_scales_ != nullptr) {
+                    for (int i = lane_id; i < num_scales_; i += 32) {
+                        auto offset = token_idx * scale_token_stride_ + i * scale_hidden_stride_;
+                        st_na_global(channel_x_scales_buffers.buffer() + dst_slot_idx * num_scales_ + i, x_scales_[offset]);
                     }
                 }
 
@@ -628,19 +599,21 @@ private:
                 token_idx++;
             }
 
-            // Move tail index - partial barrier ensures all warps in this rank
-            // have completed their data writes before warp 0 publishes the tail
-            partial_barrier(barrier_counters_ + responsible_rank, num_send_warps_per_rank, barrier_epoch, item);
+            // Single warp per rank: sub-group barrier is sufficient before publishing tail
+            sycl::group_barrier(item.get_sub_group());
             
-            if (send_warp_id_in_rank == 0 && elect_one_sync(item)) {
-                st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
+            if (elect_one_sync(item)) {
+                // Fence ensures all prior UC data stores are visible before tail publish
+                memory_fence_system();
+                st_volatile_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
             }
         }
+
     }
 
     void dispatch_receiver(
         sycl::nd_item<1> item,
-        int num_threads_per_rank,
+        int sm_id,
         int num_channels,
         int responsible_rank,
         int responsible_channel,
@@ -654,26 +627,17 @@ private:
         Buffer<float>& channel_topk_weights_buffers,
         Buffer<float>& channel_x_scales_buffers) const {
         
-        const auto thread_id = static_cast<int>(item.get_local_id(0));
         const auto lane_id = get_lane_id(item);
-        
-        constexpr int num_recv_warps = kNumThreads / 32;
-        constexpr int num_recv_warps_per_rank = num_recv_warps / kNumRanks;
-        const auto recv_thread_id = thread_id;
-        const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
-        const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
-        int barrier_epoch = 0;
 
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs_[rank_]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank_] : 0;
-    
 
         int total_offset = 0, num_tokens_to_recv = 0;
         if (elect_one_sync(item)) {
             int loop_count = 0;
             while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0) {
                 loop_count++;
-                if (loop_count > 100000000) {
+                if (loop_count > 1000000) {
                     break;
                 }
             }
@@ -681,47 +645,40 @@ private:
             loop_count = 0;
             while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0) {
                 loop_count++;
-                if (loop_count > 100000000) {
+                if (loop_count > 1000000) {
                     break;
                 }
             }
             total_offset = -total_offset - 1;
             num_tokens_to_recv = -num_tokens_to_recv - 1;
 
-            if (recv_warp_id_in_rank == 0)
-                recv_channel_offset_[responsible_rank * num_channels + responsible_channel] = total_offset;
+            recv_channel_offset_[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
         total_offset = warp_broadcast(total_offset, 0, item);
         total_offset += rank_offset;
         num_tokens_to_recv = warp_broadcast(num_tokens_to_recv, 0, item);
 
-        // ==================== RECEIVER STEP C: 数据接收循环 ====================
+        // ==================== Data receive loop ====================
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         
         while (num_tokens_to_recv > 0) {
-            // Wait for new data - only the first thread of the rank group polls
-            // and writes the result to SLM for other warps to read after barrier
-            if (recv_thread_id_in_rank == 0) {
+            // Wait for new data - single warp polls directly
+            if (elect_one_sync(item)) {
                 int loop_count = 0;
                 while (true) {
-                    cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
+                    cached_channel_tail_idx = ld_volatile_global(channel_tail_idx.buffer());
                     if (cached_channel_head_idx != cached_channel_tail_idx) {
-                        shared_channel_tail_idx_[responsible_rank] = cached_channel_tail_idx;
                         break;
                     }
                     loop_count++;
-                    if (loop_count > 100000000) {
-                        // Timeout: write head so all warps see 0 tokens and exit
-                        shared_channel_tail_idx_[responsible_rank] = cached_channel_head_idx;
+                    if (loop_count > 1000000) {
                         break;
                     }
                 }
             }
-
-            // Partial barrier R2: ensures all warps see the SLM tail_idx write
-            partial_barrier(barrier_counters_ + responsible_rank, num_recv_warps_per_rank, barrier_epoch, item);
-            cached_channel_tail_idx = shared_channel_tail_idx_[responsible_rank];
+            // Broadcast tail_idx to all lanes
+            cached_channel_tail_idx = warp_broadcast(cached_channel_tail_idx, 0, item);
 
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             
@@ -730,8 +687,8 @@ private:
                 break;
             }
             
-            // Copy data - each warp handles its portion
-            for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank) {
+            // Copy data - single warp handles all tokens sequentially
+            for (int chunk_idx = 0; chunk_idx < num_recv_tokens; chunk_idx++) {
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens_;
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4_;
                 auto shifted_recv_x_int4 = recv_x_ + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4_;
@@ -739,16 +696,16 @@ private:
             }
 
             // Copy src_idx
-            for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank; 
+            for (int chunk_idx = cached_channel_head_idx + lane_id; 
                  chunk_idx < cached_channel_tail_idx;
-                 chunk_idx += 32 * num_recv_warps_per_rank) {
+                 chunk_idx += 32) {
                 recv_src_idx_[total_offset + chunk_idx - cached_channel_head_idx] =
                     ld_nc_global(channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens_);
             }
 
             // Copy topk_idx and topk_weights
             if (recv_topk_idx_ != nullptr) {
-                for (int idx = recv_thread_id_in_rank; idx < num_recv_tokens * num_topk_; idx += 32 * num_recv_warps_per_rank) {
+                for (int idx = lane_id; idx < num_recv_tokens * num_topk_; idx += 32) {
                     int chunk_idx = idx / num_topk_, token_topk_idx = idx % num_topk_;
                     int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens_;
                     auto recv_idx = static_cast<int64_t>(total_offset + chunk_idx) * num_topk_ + token_topk_idx;
@@ -760,7 +717,7 @@ private:
 
             // Copy x_scales
             if (recv_x_scales_ != nullptr) {
-                for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_scales_; i += 32 * num_recv_warps_per_rank) {
+                for (int i = lane_id; i < num_recv_tokens * num_scales_; i += 32) {
                     int chunk_idx = i / num_scales_, scales_idx = i % num_scales_;
                     int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens_;
                     recv_x_scales_[static_cast<int64_t>(total_offset + chunk_idx) * num_scales_ + scales_idx] =
@@ -772,16 +729,16 @@ private:
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
             
-            // Partial barrier R3: ensures all warps finish copying before updating head
-            partial_barrier(barrier_counters_ + responsible_rank, num_recv_warps_per_rank, barrier_epoch, item);
+            // Single warp: sub-group barrier then update head
+            sycl::group_barrier(item.get_sub_group());
             
-            // Only the last warp's leader updates head_idx
-            if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 && elect_one_sync(item)) {
-                st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
+            if (elect_one_sync(item)) {
+                st_volatile_global(channel_head_idx.buffer(), cached_channel_head_idx);
             }
 
             num_tokens_to_recv -= num_recv_tokens;
         }
+
     }
 
     // Member variables
@@ -844,29 +801,23 @@ void dispatch(void* recv_x,
               int num_recv_buffer_tokens) {
     
     
-    // Use 192 threads (6 warps) so that for 2 ranks we get 3 warps/rank.
-    // Cross-warp synchronization within a rank uses atomic-counter based partial_barrier.
-    constexpr int kNumThreads = 192;
+    // kNumThreads = kNumRanks * 32: exactly one warp per rank.
+    // No partial_barrier needed — each rank's work is handled by a single warp.
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_sms % 2 == 0);
-    
-
-    sycl::range<1> global_range(num_sms * kNumThreads);
-    sycl::range<1> local_range(kNumThreads);
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                     \
-    case ranks:                                                                                         \
+    case ranks: {                                                                                       \
+        constexpr int kLaunchThreads = ranks * 32;                                                     \
+        sycl::range<1> global_range(num_sms * kLaunchThreads);                                         \
+        sycl::range<1> local_range(kLaunchThreads);                                                    \
         stream.submit([&](sycl::handler& cgh) {                                                        \
-            /* Local memory for shared_channel_tail_idx (receiver cross-warp communication) */          \
-            sycl::local_accessor<int, 1> shared_tail_idx(sycl::range<1>(ranks), cgh);                 \
-            /* Local memory for atomic barrier counters (one per rank) */                               \
-            sycl::local_accessor<int, 1> barrier_counters(sycl::range<1>(ranks), cgh);                \
             cgh.parallel_for(                                                                          \
                 sycl::nd_range<1>(global_range, local_range),                                          \
                 [=](sycl::nd_item<1> item) {                                                           \
-                    DispatchKernel<ranks, kNumThreads> kernel(                                         \
+                    DispatchKernel<ranks, kLaunchThreads> kernel(                                      \
                         reinterpret_cast<int4*>(recv_x),                                               \
                         recv_x_scales,                                                                 \
                         recv_src_idx,                                                                  \
@@ -892,18 +843,19 @@ void dispatch(void* recv_x,
                         rank,                                                                          \
                         num_max_send_tokens,                                                           \
                         num_recv_buffer_tokens,                                                        \
-                        shared_tail_idx.get_pointer(),                                                 \
-                        barrier_counters.get_pointer());                                               \
+                        nullptr,                                                                       \
+                        nullptr);                                                                      \
                     kernel(item);                                                                      \
                 });                                                                                    \
         });                                                                                            \
-        break
+        break;                                                                                         \
+    }
 
     switch (num_ranks) {
         DISPATCH_LAUNCH_CASE(1);
         DISPATCH_LAUNCH_CASE(2);
-        // DISPATCH_LAUNCH_CASE(4);  // TODO: enable when tested with higher kNumThreads
-        // DISPATCH_LAUNCH_CASE(8);  // TODO: enable when tested with higher kNumThreads
+        DISPATCH_LAUNCH_CASE(4);
+        DISPATCH_LAUNCH_CASE(8);
         default:
             EP_HOST_ASSERT(false && "Unsupported number of ranks");
     }

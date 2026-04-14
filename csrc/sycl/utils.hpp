@@ -234,12 +234,47 @@ SYCL_EXTERNAL inline void st_relaxed_sys_global(T* ptr, T value) {
 
 template <typename T>
 SYCL_EXTERNAL inline T ld_nc_global(const T* ptr) {
-    return *ptr;  // SYCL编译器会自动优化
+#ifdef __SYCL_DEVICE_ONLY__
+    // IPC cross-GPU reads must bypass cache (LSC uncached)
+    // Decompose to int32 loads for any type
+    static_assert(sizeof(T) % sizeof(int) == 0, "ld_nc_global requires sizeof(T) divisible by 4");
+    constexpr int N = sizeof(T) / sizeof(int);
+    union { T val; int ints[N]; } u;
+    const int* p = reinterpret_cast<const int*>(ptr);
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        int tmp;
+        asm volatile(
+            "lsc_load.ugm.uc.uc (M1, 32) %0:d32 flat[%1]:a64"
+            : "=rw"(tmp) : "rw"(p + i)
+        );
+        u.ints[i] = tmp;
+    }
+    return u.val;
+#else
+    return *ptr;
+#endif
 }
 
 template <typename T>
 SYCL_EXTERNAL inline void st_na_global(T* ptr, T value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    // IPC cross-GPU writes must bypass cache (LSC uncached)
+    static_assert(sizeof(T) % sizeof(int) == 0, "st_na_global requires sizeof(T) divisible by 4");
+    constexpr int N = sizeof(T) / sizeof(int);
+    union { T val; int ints[N]; } u;
+    u.val = value;
+    int* p = reinterpret_cast<int*>(ptr);
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        asm volatile(
+            "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32"
+            : : "rw"(p + i), "rw"(u.ints[i]) : "memory"
+        );
+    }
+#else
     *ptr = value;
+#endif
 }
 
 #ifdef __SYCL_DEVICE_ONLY__
