@@ -565,10 +565,10 @@ private:
                 // Get an empty slot
                 int dst_slot_idx = (cached_channel_tail_idx++) % num_recv_buffer_tokens_;
 
-                // Copy data
+                // Copy data (d32x4 vector load/store — 1 instruction per int4 vs 2x d64)
                 auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4_;
                 auto shifted_x = x_ + token_idx * hidden_int4_;
-                UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_channel_x_buffers, shifted_x, ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_channel_x_buffers, shifted_x, ld_nc_global_v, st_na_global_v);
 
                 if (elect_one_sync(item))
                     st_na_global(channel_src_idx_buffers.buffer() + dst_slot_idx, static_cast<int>(token_idx));
@@ -692,7 +692,7 @@ private:
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens_;
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4_;
                 auto shifted_recv_x_int4 = recv_x_ + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4_;
-                UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY(5, lane_id, hidden_int4_, shifted_recv_x_int4, shifted_buffer_x_int4, ld_nc_global_v, st_na_global_v);
             }
 
             // Copy src_idx

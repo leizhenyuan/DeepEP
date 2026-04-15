@@ -272,6 +272,45 @@ SYCL_EXTERNAL inline T ld_nc_global(const T* ptr) {
 #endif
 }
 
+// d32x4 vector load — single LSC instruction for 16 bytes per lane (vs 2x d64)
+// Only for 16-byte types (e.g. int4 = 4x int32)
+template <typename T>
+SYCL_EXTERNAL inline T ld_nc_global_v(const T* ptr) {
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(sizeof(T) == 16, "ld_nc_global_v requires sizeof(T) == 16");
+    using vec4_t = typename sycl::vec<uint32_t, 4>::vector_t;
+    vec4_t tmp;
+    auto* addr = reinterpret_cast<const void*>(ptr);
+    asm volatile(
+        "lsc_load.ugm.uc.uc (M1, 32) %0:d32x4 flat[%1]:a64"
+        : "=rw"(tmp) : "rw"(addr)
+    );
+    T result;
+    __builtin_memcpy(&result, &tmp, 16);
+    return result;
+#else
+    return *ptr;
+#endif
+}
+
+// d32x4 vector store — single LSC instruction for 16 bytes per lane
+template <typename T>
+SYCL_EXTERNAL inline void st_na_global_v(T* ptr, T value) {
+#ifdef __SYCL_DEVICE_ONLY__
+    static_assert(sizeof(T) == 16, "st_na_global_v requires sizeof(T) == 16");
+    using vec4_t = typename sycl::vec<uint32_t, 4>::vector_t;
+    vec4_t tmp;
+    __builtin_memcpy(&tmp, &value, 16);
+    auto* addr = reinterpret_cast<void*>(ptr);
+    asm volatile(
+        "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32x4"
+        : : "rw"(addr), "rw"(tmp) : "memory"
+    );
+#else
+    *ptr = value;
+#endif
+}
+
 template <typename T>
 SYCL_EXTERNAL inline void st_na_global(T* ptr, T value) {
 #ifdef __SYCL_DEVICE_ONLY__
