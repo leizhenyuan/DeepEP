@@ -236,21 +236,37 @@ template <typename T>
 SYCL_EXTERNAL inline T ld_nc_global(const T* ptr) {
 #ifdef __SYCL_DEVICE_ONLY__
     // IPC cross-GPU reads must bypass cache (LSC uncached)
-    // Decompose to int32 loads for any type
+    // Use d64 when possible to halve PCIe transactions
     static_assert(sizeof(T) % sizeof(int) == 0, "ld_nc_global requires sizeof(T) divisible by 4");
     constexpr int N = sizeof(T) / sizeof(int);
-    union { T val; int ints[N]; } u;
-    const int* p = reinterpret_cast<const int*>(ptr);
-    #pragma unroll
-    for (int i = 0; i < N; ++i) {
-        int tmp;
-        asm volatile(
-            "lsc_load.ugm.uc.uc (M1, 32) %0:d32 flat[%1]:a64"
-            : "=rw"(tmp) : "rw"(p + i)
-        );
-        u.ints[i] = tmp;
+    if constexpr (N >= 2 && N % 2 == 0) {
+        constexpr int N64 = N / 2;
+        union { T val; int64_t i64s[N64]; } u;
+        const int64_t* p = reinterpret_cast<const int64_t*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N64; ++i) {
+            int64_t tmp;
+            asm volatile(
+                "lsc_load.ugm.uc.uc (M1, 32) %0:d64 flat[%1]:a64"
+                : "=rw"(tmp) : "rw"(p + i)
+            );
+            u.i64s[i] = tmp;
+        }
+        return u.val;
+    } else {
+        union { T val; int ints[N]; } u;
+        const int* p = reinterpret_cast<const int*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            int tmp;
+            asm volatile(
+                "lsc_load.ugm.uc.uc (M1, 32) %0:d32 flat[%1]:a64"
+                : "=rw"(tmp) : "rw"(p + i)
+            );
+            u.ints[i] = tmp;
+        }
+        return u.val;
     }
-    return u.val;
 #else
     return *ptr;
 #endif
@@ -260,17 +276,32 @@ template <typename T>
 SYCL_EXTERNAL inline void st_na_global(T* ptr, T value) {
 #ifdef __SYCL_DEVICE_ONLY__
     // IPC cross-GPU writes must bypass cache (LSC uncached)
+    // Use d64 when possible to halve PCIe transactions
     static_assert(sizeof(T) % sizeof(int) == 0, "st_na_global requires sizeof(T) divisible by 4");
     constexpr int N = sizeof(T) / sizeof(int);
-    union { T val; int ints[N]; } u;
-    u.val = value;
-    int* p = reinterpret_cast<int*>(ptr);
-    #pragma unroll
-    for (int i = 0; i < N; ++i) {
-        asm volatile(
-            "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32"
-            : : "rw"(p + i), "rw"(u.ints[i]) : "memory"
-        );
+    if constexpr (N >= 2 && N % 2 == 0) {
+        constexpr int N64 = N / 2;
+        union { T val; int64_t i64s[N64]; } u;
+        u.val = value;
+        int64_t* p = reinterpret_cast<int64_t*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N64; ++i) {
+            asm volatile(
+                "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d64"
+                : : "rw"(p + i), "rw"(u.i64s[i]) : "memory"
+            );
+        }
+    } else {
+        union { T val; int ints[N]; } u;
+        u.val = value;
+        int* p = reinterpret_cast<int*>(ptr);
+        #pragma unroll
+        for (int i = 0; i < N; ++i) {
+            asm volatile(
+                "lsc_store.ugm.uc.uc (M1, 32) flat[%0]:a64 %1:d32"
+                : : "rw"(p + i), "rw"(u.ints[i]) : "memory"
+            );
+        }
     }
 #else
     *ptr = value;

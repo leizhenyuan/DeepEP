@@ -289,7 +289,8 @@ def main():
               f'repeat={args.repeat}, warmup={args.warmup}', flush=True)
         print(f'[config] dtype=int32 (exact verification, no precision loss)', flush=True)
 
-    buffer = deep_ep.Buffer(group, int(1e9), 0, low_latency_mode=False, num_qps_per_rank=1)
+    mpi_comm = MPI.COMM_WORLD
+    buffer = deep_ep.Buffer(group, int(1e9), 0, low_latency_mode=False, num_qps_per_rank=1, comm=mpi_comm)
 
     # 构建路由（所有迭代共享）
     topk_idx, topk_weights, is_token_in_rank, num_tokens_per_rank, num_tokens_per_expert = \

@@ -107,7 +107,7 @@ void cached_notify_combine(void** buffer_ptrs,
                            int num_ranks,
                            sycl::queue& stream);
 
-void combine(std::nullptr_t type,  // DataType placeholder for SYCL
+void combine(DataType type,
              void* recv_x,
              float* recv_topk_weights,
              const void* x,

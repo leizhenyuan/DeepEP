@@ -50,9 +50,13 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 #undef INT_BITS_T2
 
 // Unified type aliases for cross-platform API
-// todo DataType should not be nullptr_t, currently for build pass
 using StreamType = sycl::queue;
-using DataType = std::nullptr_t;
+
+// Data type enum for kernel dispatch (replaces CUDA's cudaDataType_t)
+enum class DataType {
+    kBFloat16,
+    kInt32,
+};
 
 }  // namespace deep_ep
 

@@ -2633,8 +2633,16 @@ deep_ep::Buffer::intranode_combine(const torch::Tensor& x,
                        num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float)  // Top-k weight buffer
                    <= num_nvl_bytes);
 
+    // Map torch dtype to SYCL DataType enum
+    DataType sycl_dtype;
+    switch (x.scalar_type()) {
+        case torch::kBFloat16: sycl_dtype = DataType::kBFloat16; break;
+        case torch::kInt32:    sycl_dtype = DataType::kInt32;    break;
+        default: EP_HOST_ASSERT(false && "Unsupported dtype for combine");
+    }
+
     // Call combine kernel
-    intranode::combine(nullptr,  // type placeholder for SYCL
+    intranode::combine(sycl_dtype,
                        recv_x.data_ptr(),
                        recv_topk_weights_ptr,
                        x.data_ptr(),

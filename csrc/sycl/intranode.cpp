@@ -1449,7 +1449,7 @@ private:
     int num_recv_buffer_tokens_;
 };
 
-void combine(std::nullptr_t type,
+void combine(DataType type,
              void* recv_x,
              float* recv_topk_weights,
              const void* x,
@@ -1472,69 +1472,78 @@ void combine(std::nullptr_t type,
              int num_max_send_tokens,
              int num_recv_buffer_tokens) {
     
-    constexpr int kNumThreads = 64;
-    constexpr int num_recv_warps = kNumThreads / 32;
-    
     // 验证参数
     EP_HOST_ASSERT(num_sms % 2 == 0);
-    EP_HOST_ASSERT(kNumThreads >= num_ranks * 32);
-    
-    sycl::range<1> global_range(num_sms * kNumThreads);
-    sycl::range<1> local_range(kNumThreads);
-    
-    
-    // 根据num_ranks选择模板实例
-    #define COMBINE_LAUNCH_CASE(ranks)                                                      \
-        case ranks: {                                                                       \
-            stream.submit([&](sycl::handler& cgh) {                                \
-                sycl::local_accessor<int, 1> warp_channel_head_idx_acc(                   \
-                    sycl::range<1>(num_recv_warps * ranks), cgh);                          \
-                sycl::local_accessor<int, 1> channel_tail_idx_acc(                        \
-                    sycl::range<1>(ranks), cgh);                                           \
-                sycl::local_accessor<int, 1> warp_retired_acc(                            \
-                    sycl::range<1>(num_recv_warps), cgh);                                   \
-                                                                                           \
-                cgh.parallel_for(                                                          \
-                    sycl::nd_range<1>(global_range, local_range),                         \
-                    [=](sycl::nd_item<1> item) {                                          \
-                        CombineKernel<sycl::ext::oneapi::bfloat16, ranks, kNumThreads> kernel( \
-                            reinterpret_cast<sycl::ext::oneapi::bfloat16*>(recv_x),       \
-                            recv_topk_weights,                                             \
-                            reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(x),      \
-                            topk_weights,                                                  \
-                            reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(bias_0), \
-                            reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(bias_1), \
-                            src_idx,                                                       \
-                            rank_prefix_matrix,                                            \
-                            channel_prefix_matrix,                                         \
-                            send_head,                                                     \
-                            num_tokens,                                                    \
-                            num_recv_tokens,                                               \
-                            hidden,                                                        \
-                            num_topk,                                                      \
-                            buffer_ptrs,                                                   \
-                            rank,                                                          \
-                            num_sms,                                                       \
-                            num_max_send_tokens,                                           \
-                            num_recv_buffer_tokens);                                       \
-                        kernel(item,                                                       \
-                               warp_channel_head_idx_acc.get_pointer(),                   \
-                               channel_tail_idx_acc.get_pointer(),                        \
-                               warp_retired_acc.get_pointer());                           \
-                    });                                                                    \
-            });                                                                            \
-            break;                                                                         \
+
+    // kNumThreads = ranks * 32: sender needs at least one warp per rank
+    // (num_send_warps_per_rank = kNumThreads/32/kNumRanks must be >= 1)
+    #define COMBINE_LAUNCH_CASE(dtype_t, ranks)                                             \
+        {                                                                                   \
+            constexpr int kLaunchThreads = ranks * 32;                                      \
+            constexpr int kLaunchRecvWarps = kLaunchThreads / 32;                           \
+            sycl::range<1> global_range(num_sms * kLaunchThreads);                          \
+            sycl::range<1> local_range(kLaunchThreads);                                     \
+            stream.submit([&](sycl::handler& cgh) {                                         \
+                sycl::local_accessor<int, 1> warp_channel_head_idx_acc(                     \
+                    sycl::range<1>(kLaunchRecvWarps * ranks), cgh);                          \
+                sycl::local_accessor<int, 1> channel_tail_idx_acc(                          \
+                    sycl::range<1>(ranks), cgh);                                             \
+                sycl::local_accessor<int, 1> warp_retired_acc(                              \
+                    sycl::range<1>(kLaunchRecvWarps), cgh);                                  \
+                                                                                             \
+                cgh.parallel_for(                                                            \
+                    sycl::nd_range<1>(global_range, local_range),                           \
+                    [=](sycl::nd_item<1> item) {                                            \
+                        CombineKernel<dtype_t, ranks, kLaunchThreads> kernel(                \
+                            reinterpret_cast<dtype_t*>(recv_x),                             \
+                            recv_topk_weights,                                               \
+                            reinterpret_cast<const dtype_t*>(x),                            \
+                            topk_weights,                                                    \
+                            reinterpret_cast<const dtype_t*>(bias_0),                       \
+                            reinterpret_cast<const dtype_t*>(bias_1),                       \
+                            src_idx,                                                         \
+                            rank_prefix_matrix,                                              \
+                            channel_prefix_matrix,                                           \
+                            send_head,                                                       \
+                            num_tokens,                                                      \
+                            num_recv_tokens,                                                 \
+                            hidden,                                                          \
+                            num_topk,                                                        \
+                            buffer_ptrs,                                                     \
+                            rank,                                                            \
+                            num_sms,                                                         \
+                            num_max_send_tokens,                                             \
+                            num_recv_buffer_tokens);                                         \
+                        kernel(item,                                                         \
+                               warp_channel_head_idx_acc.get_pointer(),                     \
+                               channel_tail_idx_acc.get_pointer(),                          \
+                               warp_retired_acc.get_pointer());                             \
+                    });                                                                      \
+            });                                                                              \
+            break;                                                                           \
         }
-    
-    switch (num_ranks) {
-        COMBINE_LAUNCH_CASE(1);
-        COMBINE_LAUNCH_CASE(2);
-        COMBINE_LAUNCH_CASE(4);
-        // COMBINE_LAUNCH_CASE(8);  // Commented out: triggers IGC ICE (malloc crash) in IGC 2.27.10 during AOT BMG compilation
+
+    #define COMBINE_RANKS_CASE(dtype_t)           \
+        switch (num_ranks) {                      \
+            case 1: COMBINE_LAUNCH_CASE(dtype_t, 1); \
+            case 2: COMBINE_LAUNCH_CASE(dtype_t, 2); \
+            case 4: COMBINE_LAUNCH_CASE(dtype_t, 4); \
+            default:                              \
+                EP_HOST_ASSERT(false && "Unsupported number of ranks"); \
+        }
+
+    switch (type) {
+        case DataType::kBFloat16:
+            COMBINE_RANKS_CASE(sycl::ext::oneapi::bfloat16);
+            break;
+        case DataType::kInt32:
+            COMBINE_RANKS_CASE(int);
+            break;
         default:
-            EP_HOST_ASSERT(false && "Unsupported number of ranks");
+            EP_HOST_ASSERT(false && "Unsupported data type for combine");
     }
-    
+
+    #undef COMBINE_RANKS_CASE
     #undef COMBINE_LAUNCH_CASE
     
     try {
