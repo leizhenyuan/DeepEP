@@ -1,7 +1,151 @@
 ---
-name: analyze-deepep-nvidia-topology
-description: "Analyze NVIDIA GPU topology usage patterns in DeepEP source code. Use when identifying how DeepEP uses NVLink, NVSHMEM, CUDA IPC handles, IBGDA NIC operations, warp synchronization, and memory ordering primitives. Covers both physical hardware topology analysis (why NVLink/RDMA) and code-level pattern extraction from csrc/."
+name: nvidia-topology-background
+description: "NVIDIA H100 SXM hardware specification and intranode/internode topology background for DeepEP porting. Contains H100 specs, NVLink/NVSwitch intranode topology, IBGDA/InfiniBand internode topology, and the hardware properties DeepEP relies on. Load as static prior knowledge — no runtime discovery needed."
 ---
+
+# NVIDIA H100 SXM — Hardware Topology Background
+
+This skill is **static prior knowledge**. All facts below are established hardware
+specifications for the NVIDIA H100 SXM platform that DeepEP was originally designed for.
+
+---
+
+## H100 SXM Hardware Specifications
+
+| Parameter | Value |
+|-----------|-------|
+| GPU architecture | Hopper (GH100) |
+| HBM3 memory | 80 GB per GPU |
+| HBM memory bandwidth | 3.35 TB/s per GPU |
+| NVLink version | NVLink 4.0 |
+| NVLink bandwidth per GPU | 900 GB/s total bidirectional |
+| PCIe slot | PCIe Gen5 x16 (~128 GB/s) |
+| L2 cache | 50 MB |
+| SM count | 132 SMs |
+| Warp size | 32 threads |
+| Shared memory per SM | up to 228 KB |
+| Cache line size | 128 bytes |
+
+---
+
+## Intranode Topology: NVSwitch + NVLink Fabric
+
+### Physical Layout (8-GPU H100 SXM Node)
+
+```
+                    Host CPU + DRAM
+                 PCIe Gen5 x16 │
+          ┌───────────────────────────────────────────────┐
+          │           NVSwitch fabric (4x NVSwitch chips)          │
+          │   GPU0 ── GPU1 ── GPU2 ── GPU3 ── GPU4 ── GPU5 ── GPU6 ── GPU7  │
+          │        all pairs connected via NVLink 4.0 (full mesh)  │
+          └───────────────────────────────────────────────┘
+```
+
+### Key Properties
+
+**1. NVLink bandwidth**: 900 GB/s bidirectional per GPU vs PCIe Gen5 x16 ~128 GB/s.
+GPU-to-GPU transfers are ~7x faster than going through PCIe.
+
+**2. NVLink is cache-coherent**: A GPU write to peer GPU memory via NVLink is immediately
+visible to the remote GPU’s L2 cache — no explicit cache flush needed on the writer side,
+no cache invalidation needed on the reader side.
+
+**3. No CPU involvement**: All GPU-to-GPU traffic flows through the NVSwitch fabric without
+touching CPU or PCIe. The CPU path is only used for host ↔ GPU transfers.
+
+**4. CUDA IPC**: `cudaIpcGetMemHandle` / `cudaIpcOpenMemHandle` provide a handle mechanism
+for one process to map another GPU’s allocation. After mapping, direct NVLink P2P reads/writes
+are used transparently.
+
+### What DeepEP Relies On (Intranode)
+
+- `intranode.cu` uses `__threadfence_system()` + flag write as the **sole synchronization**
+  between producer and consumer GPUs. This works **only because NVLink is cache-coherent** —
+  the data written to peer memory is visible before the flag write is observed.
+- Buffer pointers in `intranode.cu` are obtained via CUDA IPC handles. After opening,
+  the pointer behaves like local device memory due to NVLink coherence.
+
+---
+
+## Internode Topology: InfiniBand + GPUDirect RDMA + IBGDA
+
+### Physical Layout (Multi-Node)
+
+```
+ Node 0:                                    Node 1:
+ CPU + DRAM                                 CPU + DRAM
+    │ PCIe                                     │ PCIe
+    ├─ GPU0 ┐                               ├─ GPU0 ┐
+    ├─ GPU1 │──────────────────────────├─ GPU1 │
+    └─ MLX HCA ┘ ─── InfiniBand HDR ─── └─ MLX HCA ┘
+         ↑ PCIe                                    ↑ PCIe
+    GPUDirect RDMA:                           GPUDirect RDMA:
+    NIC DMA’s directly                        NIC DMA’s directly
+    from GPU HBM                              to GPU HBM
+```
+
+### GPUDirect RDMA
+
+The NIC (HCA) performs DMA directly to/from GPU HBM via PCIe BAR mapping —
+the CPU is **not in the data path**. This requires:
+- The GPU and HCA to be on the same PCIe root complex (or switch with P2P enabled)
+- The `nvidia-peermem` kernel module loaded
+- RDMA operations target GPU virtual addresses (registered with `ibv_reg_mr`)
+
+### NVSHMEM
+
+NVSHMEM provides a symmetric heap abstraction over GPU RDMA. Key operations:
+- `nvshmem_put*`: GPU-issued PUT (writes to remote PE’s symmetric heap)
+- `nvshmem_get*`: GPU-issued GET (reads from remote PE’s symmetric heap)
+- `nvshmem_quiet()`: wait for all outstanding PUT/GET DMAs to complete
+- `nvshmem_fence()`: order operations (but does not wait for completion)
+- `nvshmem_barrier_all()`: collective barrier across all PEs
+
+### IBGDA (InfiniBand GPU Direct Async)
+
+IBGDA is an advanced mode where the **GPU kernel directly posts Work Queue Entries (WQEs)**
+to the NIC’s QP (Queue Pair) — no CPU involvement per operation:
+
+```
+CPU path (traditional):   GPU → CPU (signal) → ibv_post_send() → NIC → RDMA
+IBGDA path:               GPU → mmio write to NIC QP doorbell → NIC → RDMA
+```
+
+IBGDA eliminates the CPU round-trip per message, reducing latency from ~5-10 µs to ~1-2 µs.
+DeepEP uses IBGDA (via NVSHMEM IBGDA backend) to achieve this low latency.
+
+**Memory ordering chain for IBGDA**:
+```
+[1] GPU writes data to symmetric heap
+[2] __threadfence_system()    ← ensures GPU L2 writeback visible to NIC DMA
+[3] GPU writes WQE to NIC QP doorbell (MMIO write via PTX st.volatile.global.u64)
+[4] NIC reads data from GPU HBM, sends RDMA write
+[5] nvshmem_quiet()           ← wait for NIC DMA completion
+[6] GPU writes notification flag to remote
+[7] Remote GPU polls flag
+```
+
+### What DeepEP Relies On (Internode)
+
+- `ibgda_device.cuh`: GPU kernel directly writes NIC QP doorbell via PTX MMIO
+- `__threadfence_system()` before doorbell write: ensures data is flushed from GPU L2
+  before the NIC DMA reads it
+- `nvshmem_quiet()` before writing notification flag: ensures RDMA write completed
+- `internode.cu` / `internode_ll.cu`: all use NVSHMEM PUT + IBGDA for low-latency path
+
+---
+
+## Hardware Properties DeepEP Assumes (Gap Analysis Input)
+
+| Property | H100 SXM | Required for DeepEP? |
+|----------|----------|---------------------|
+| Cache-coherent P2P (intranode) | ✅ NVLink coherent | ✅ YES — no explicit flush between GPU writes |
+| GPU-direct NIC DMA (internode) | ✅ GPUDirect RDMA | ✅ YES — no CPU in data path |
+| GPU posts NIC doorbell directly | ✅ IBGDA | ✅ YES — eliminates CPU round-trip latency |
+| Warp size = 32 | ✅ fixed | Encoded in kernel launch configs |
+| `__threadfence_system()` orders NIC DMA | ✅ verified on Hopper | ⚠️ Needs verification on Intel |
+
 
 # Analyze DeepEP NVIDIA Topology
 
