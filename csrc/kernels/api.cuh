@@ -1,7 +1,6 @@
 #pragma once
 
 #include <vector>
-
 #include "configs.cuh"
 
 namespace deep_ep {
@@ -9,7 +8,7 @@ namespace deep_ep {
 // Intranode runtime
 namespace intranode {
 
-void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, cudaStream_t stream);
+void barrier(int** barrier_signal_ptrs, int rank, int num_ranks, deep_ep::StreamType stream);
 
 }  // namespace intranode
 
@@ -42,13 +41,13 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
                          int num_topk,
                          int num_ranks,
                          int num_experts,
-                         cudaStream_t stream);
+                         deep_ep::StreamType stream);
 
 }  // namespace layout
 
 // Intranode kernels
 namespace intranode {
-
+// 接收者视角
 void notify_dispatch(const int* num_tokens_per_rank,
                      int* moe_recv_counter_mapped,
                      int num_ranks,
@@ -64,7 +63,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      void** buffer_ptrs,
                      int** barrier_signal_ptrs,
                      int rank,
-                     cudaStream_t stream,
+                     deep_ep::StreamType stream,
                      int num_sms);
 
 void cached_notify_dispatch(const int* rank_prefix_matrix,
@@ -73,7 +72,7 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
                             int** barrier_signal_ptrs,
                             int rank,
                             int num_ranks,
-                            cudaStream_t stream);
+                            deep_ep::StreamType stream);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -99,7 +98,7 @@ void dispatch(void* recv_x,
               void** buffer_ptrs,
               int rank,
               int num_ranks,
-              cudaStream_t stream,
+              deep_ep::StreamType stream,
               int num_sms,
               int num_max_send_tokens,
               int num_recv_buffer_tokens);
@@ -112,9 +111,9 @@ void cached_notify_combine(void** buffer_ptrs,
                            int** barrier_signal_ptrs,
                            int rank,
                            int num_ranks,
-                           cudaStream_t stream);
+                           deep_ep::StreamType stream);
 
-void combine(cudaDataType_t type,
+void combine(deep_ep::DataType type,
              void* recv_x,
              float* recv_topk_weights,
              const void* x,
@@ -132,7 +131,7 @@ void combine(cudaDataType_t type,
              void** buffer_ptrs,
              int rank,
              int num_ranks,
-             cudaStream_t stream,
+             deep_ep::StreamType stream,
              int num_sms,
              int num_max_send_tokens,
              int num_recv_buffer_tokens);
@@ -170,7 +169,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int num_max_nvl_chunked_recv_tokens,
                      int** barrier_signal_ptrs,
                      int rank,
-                     cudaStream_t stream,
+                     deep_ep::StreamType stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
                      bool low_latency_mode);
@@ -210,7 +209,7 @@ void dispatch(void* recv_x,
               int rank,
               int num_ranks,
               bool is_cached_dispatch,
-              cudaStream_t stream,
+              deep_ep::StreamType stream,
               int num_channels,
               bool low_latency_mode);
 
@@ -231,13 +230,13 @@ void cached_notify(int hidden_int4,
                    int num_max_nvl_chunked_recv_tokens,
                    int** barrier_signal_ptrs,
                    int rank,
-                   cudaStream_t stream,
+                   deep_ep::StreamType stream,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
                    bool low_latency_mode);
 
-void combine(cudaDataType_t type,
+void combine(deep_ep::DataType type,
              void* combined_x,
              float* combined_topk_weights,
              const bool* is_combined_token_in_rank,
@@ -263,7 +262,7 @@ void combine(cudaDataType_t type,
              int num_max_nvl_chunked_recv_tokens,
              int rank,
              int num_ranks,
-             cudaStream_t stream,
+             deep_ep::StreamType stream,
              int num_channels,
              bool low_latency_mode);
 
@@ -280,7 +279,7 @@ void clean_low_latency_buffer(int* clean_0,
                               int num_ranks,
                               int* mask_buffer,
                               int* sync_buffer,
-                              cudaStream_t stream);
+                              deep_ep::StreamType stream);
 
 void dispatch(void* packed_recv_x,
               void* packed_recv_x_scales,
@@ -309,7 +308,7 @@ void dispatch(void* packed_recv_x,
               bool use_ue8m0,
               void* workspace,
               int num_device_sms,
-              cudaStream_t stream,
+              deep_ep::StreamType stream,
               int phases);
 
 void combine(void* combined_x,
@@ -335,15 +334,15 @@ void combine(void* combined_x,
              bool use_logfmt,
              void* workspace,
              int num_device_sms,
-             cudaStream_t stream,
+             deep_ep::StreamType stream,
              int phases,
              bool zero_copy);
 
-void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
+void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, deep_ep::StreamType stream);
 
-void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, cudaStream_t stream);
+void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, deep_ep::StreamType stream);
 
-void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream);
+void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, deep_ep::StreamType stream);
 
 }  // namespace internode_ll
 

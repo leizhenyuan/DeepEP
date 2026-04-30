@@ -9,6 +9,8 @@ import deep_ep_cpp
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
 
+USE_XPU = os.environ.get('USE_XPU', '0').lower() in ('1', 'true', 'yes')
+USE_CUDA = os.environ.get('USE_CUDA', '0').lower() in ('1', 'true', 'yes')
 
 class Buffer:
     """
@@ -55,6 +57,7 @@ class Buffer:
                 this is somehow incompatible with the hook-based overlapping.
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
+            先理解为一个NVL72的特殊的跨节点连接方式吧
             allow_mnnvl: whether to allow MNNVL
             use_fabric: whether to use fabric API for memory buffers.
             enable_shrink: whether to enable shrink mode. The enable mode allocates a mask buffer to support masking ranks dynamically.
@@ -63,7 +66,7 @@ class Buffer:
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
         """
-        check_nvlink_connections(group)
+        # check_nvlink_connections(group)
 
         # Initialize the CPP runtime
         if group is not None:
@@ -73,7 +76,9 @@ class Buffer:
 
             def all_gather_object(obj):
                 object_list = [None] * self.group_size
+                print("before all gather", flush=True)
                 dist.all_gather_object(object_list, obj, group)
+                print("after all gather", flush=True)
                 return object_list
         elif comm is not None:
             self.rank = comm.Get_rank()
@@ -88,47 +93,67 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+        # shrink 让某些节点不参与专家计算
         self.enable_shrink = enable_shrink
+        print("[info] before cpp buffer init", flush=True)
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink, use_fabric)
-
+        print("[info] after cpp buffer init", flush=True)
         # Synchronize device IDs
         local_device_id = self.runtime.get_local_device_id()
+        print("[info] here? before all gather device ids", local_device_id, flush=True)
         device_ids = all_gather_object(local_device_id)
-
+        print("[info] Synchronizing device IDs", device_ids, flush=True)
         # Synchronize IPC handles
-        local_ipc_handle = self.runtime.get_local_ipc_handle()
-        ipc_handles = all_gather_object(local_ipc_handle)
+        if USE_CUDA:
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            # 获取到所有进程的IPC handles，注意是不同node上面的
+            ipc_handles = all_gather_object(local_ipc_handle)
+        elif USE_XPU:
+            local_ipc_handle = self.runtime.get_local_ipc_handle()
+            # 根据初始化方式选择 barrier 函数
+            if comm is not None:
+                # MPI 模式：使用 MPI barrier（硬同步，更精确）
+                barrier_func = comm.Barrier
+            else:
+                # PyTorch 分布式模式：使用 dist.barrier
+                barrier_func = dist.barrier
+            ipc_handles = self.runtime.all_gather_handle(local_ipc_handle, barrier_func)
 
+        print("[info] after all gather ipc handles", ipc_handles, flush=True)
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
-        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode:
+        if self.runtime.get_num_rdma_ranks() > 1 or low_latency_mode and USE_CUDA:
             # Enable IBGDA
             assert num_qps_per_rank > 0
-            os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
-            os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+            # todo 使用环境变量或许更好一些？
+            # os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
+            # os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+            # # rdma 的qp 数量，一个local expert 一个qp
+            # os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
-            # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
-            self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
-            os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
+            # # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
+            # self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
+            # os.environ['NVSHMEM_QP_DEPTH'] = str(self.nvshmem_qp_depth)
 
-            # Reduce gpu memory usage
-            # 6 default teams + 1 extra team
-            os.environ['NVSHMEM_MAX_TEAMS'] = '7'
-            # Disable NVLink SHArP
-            os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
-            # NOTES: NVSHMEM initialization requires at least 256 MiB
-            os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+            # # Reduce gpu memory usage
+            # # 6 default teams + 1 extra team
+            # os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+            # # Disable NVLink SHArP
+            # os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+            # # NOTES: NVSHMEM initialization requires at least 256 MiB
+            # os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
 
-            if not allow_mnnvl:
-                # Disable multi-node NVLink detection
-                os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
+            # if not allow_mnnvl:
+            #     # Disable multi-node NVLink detection
+            #     os.environ['NVSHMEM_DISABLE_MNNVL'] = '1'
 
             # Synchronize using the root ID
             if (low_latency_mode and self.rank == 0) or (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
                 root_unique_id = self.runtime.get_local_nvshmem_unique_id()
             nvshmem_unique_ids = all_gather_object(root_unique_id)
+            # 统一一个 nvshmem unique id
+            # global ? nvl_rank : 0;
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
         # Make CPP runtime available
@@ -219,6 +244,27 @@ class Buffer:
         assert tensor.numel() >= size.numel()
         return tensor[:size.numel()].view(size)
 
+    def get_remote_buffer_tensor(self,
+                                 target_rank: int,
+                                 dtype: torch.dtype,
+                                 size: Optional[torch.Size] = None,
+                                 offset: int = 0) -> torch.Tensor:
+        """
+        Get a remote rank's buffer as a PyTorch tensor via IPC.
+
+        Argument:
+            target_rank: the rank whose buffer to access (0 to num_nvl_ranks-1).
+            dtype: the data type (PyTorch `dtype`) for the tensor.
+            size: the slice size (by elements) to get from the buffer.
+            offset: the offset of the beginning element.
+        """
+        tensor = self.runtime.get_remote_buffer_tensor(target_rank, dtype, offset)
+        if size is None:
+            return tensor
+
+        assert tensor.numel() >= size.numel()
+        return tensor[:size.numel()].view(size)
+
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
         bias_0, bias_1 = None, None
@@ -242,6 +288,11 @@ class Buffer:
         """
 
         # TODO: automatically tune
+        # int num_sms;
+        # int num_max_nvl_chunked_send_tokens;
+        # int num_max_nvl_chunked_recv_tokens;
+        # int num_max_rdma_chunked_send_tokens;
+        # int num_max_rdma_chunked_recv_tokens;
         config_map = {
             2: Config(Buffer.num_sms, 24, 256, 6, 128),
             4: Config(Buffer.num_sms, 6, 256, 6, 128),
@@ -290,6 +341,7 @@ class Buffer:
         return config_map[num_ranks]
 
     # noinspection PyTypeChecker
+    # 发送者视角
     def get_dispatch_layout(self, topk_idx: torch.Tensor, num_experts: int,
                             previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                             allocate_on_comm_stream: bool = False) -> \
@@ -321,12 +373,17 @@ class Buffer:
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                  handle: Optional[Tuple] = None,
-                 num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
-                 is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
-                 topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None,
-                 expert_alignment: int = 1, num_worst_tokens: int = 0,
+                 num_tokens_per_rank: Optional[torch.Tensor] = None, 
+                 num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+                 is_token_in_rank: Optional[torch.Tensor] = None, 
+                 num_tokens_per_expert: Optional[torch.Tensor] = None,
+                 topk_idx: Optional[torch.Tensor] = None, 
+                 topk_weights: Optional[torch.Tensor] = None,
+                 expert_alignment: int = 1, 
+                 num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
-                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
+                 previous_event: Optional[EventOverlap] = None, 
+                 async_finish: bool = False,
                  allocate_on_comm_stream: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                   Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
@@ -370,10 +427,14 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
         # Default config
+        import logging
+        logging.basicConfig(level=logging.DEBUG, 
+                   format=f'[Rank {self.rank}] %(asctime)s - %(message)s')
+        logging.debug(f"[Rank {self.rank}] Before dispatch config")
         config = self.get_dispatch_config(self.group_size) if config is None else config
-
+        logging.debug(f"[Rank {self.rank}] After dispatch config: {config}")
         # Internode
-        if self.runtime.get_num_rdma_ranks() > 1:
+        if self.runtime.get_num_rdma_ranks() > 1 and not USE_XPU:
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
                                            previous_event, async_finish, allocate_on_comm_stream)
@@ -384,17 +445,24 @@ class Buffer:
             assert topk_idx is None and topk_weights is None
             rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
             num_recv_tokens = recv_src_idx.size(0)
+            logging.debug(f"[Rank {self.rank}] Before intranode dispatch dispatch with handle")
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
                 x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            logging.debug(f"[Rank {self.rank}] After intranode dispatch dispatch with handle")
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
+            logging.debug(f"[Rank {self.rank}] Before intranode dispatch dispatch no handle")
+            (recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, 
+             num_recv_tokens_per_expert_list, rank_prefix_matrix, 
+             channel_prefix_matrix, recv_channel_prefix_matrix, 
+             recv_src_idx, send_head, event) = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                                 expert_alignment, num_worst_tokens, config,
                                                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+            logging.debug(f"[Rank {self.rank}] After intranode dispatch dispatch no handle")
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             return (
                 recv_x, recv_x_scales

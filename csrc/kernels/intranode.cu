@@ -8,37 +8,47 @@ namespace deep_ep {
 
 namespace intranode {
 
+// launch 1 + num_ranks 个block，每个block 128 rank
+// 用来计算dispatch 和combine阶段所需要的metadata
+// sm0 使用IPC 进行隐式的内存通信
 template <int kNumRanks>
-__global__ void notify_dispatch(const int* num_tokens_per_rank,
-                                int* moe_recv_counter_mapped,
-                                const int* num_tokens_per_expert,
-                                int* moe_recv_expert_counter_mapped,
-                                int num_experts,
-                                int num_tokens,
-                                int num_channels,
-                                const bool* is_token_in_rank,
-                                int* channel_prefix_matrix,
-                                int* rank_prefix_matrix_copy,
-                                int num_memset_int,
-                                int expert_alignment,
-                                void** buffer_ptrs,
-                                int** barrier_signal_ptrs,
-                                int rank) {
+__global__ void notify_dispatch(
+    const int* num_tokens_per_rank,           // [num_ranks] 每个rank的token数
+    int* moe_recv_counter_mapped,             // 当前rank接收的总token数
+    const int* num_tokens_per_expert,         // [num_experts] 每个expert的token数
+    int* moe_recv_expert_counter_mapped,      // [num_experts_per_rank] 当前rank的expert收到的token数
+    int num_experts,
+    int num_tokens,                           
+    int num_channels,                         // dispatch的channel数
+    const bool* is_token_in_rank,             // [num_tokens, num_ranks] 路由表
+    int* channel_prefix_matrix,               // [num_ranks, num_channels] 输出：每个rank-channel对的token数
+    int* rank_prefix_matrix_copy,             // [num_ranks, num_ranks] 输出：rank间前缀和
+    int num_memset_int,
+    int expert_alignment,
+    void** buffer_ptrs,                       // 所有rank的GPU缓冲区指针
+    int** barrier_signal_ptrs,                // 所有rank的barrier信号指针
+    int rank
+    ) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % 32, warp_id = thread_id / 32, num_warps = num_threads / 32;
 
     if (sm_id == 0) {
         // Barrier first
+        // 不同rank上同样id的block进行同步
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
         int *per_rank_buffer, *per_expert_buffer;
+        // 每个线程负责一个rank
         if (thread_id < kNumRanks) {
+            // 创建了一个 rank to rank 的list
             per_rank_buffer = static_cast<int*>(buffer_ptrs[thread_id]);
+            // rank i to local expert j 的token数
             per_expert_buffer = per_rank_buffer + kNumRanks * kNumRanks;
         }
 
         // After this loop:
+        // 这里每个rank 只会写自己rank对应的行，所以没有冲突，并且可以进行同步
         //  - `per_rank_buffer[rank][i, j]` means the number of tokens from rank i to rank j
         //  - `per_expert_buffer[rank][i, j]` means the number of tokens from rank i to local expert j
         int num_experts_per_rank = num_experts / kNumRanks;
@@ -49,6 +59,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 per_expert_buffer[rank * num_experts_per_rank + i] = num_tokens_per_expert[thread_id * num_experts_per_rank + i];
         }
 
+        // 全局的rank 全部完成了自己的数据统计
         // Wait for all ranks to be finished
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 
@@ -87,18 +98,26 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
 
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
+        
     } else {
         int dst_rank = sm_id - 1;
+        // 每个warp 处理一个channel
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
+            // 计算这个channel在token空间的范围
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
             // Iterate over tokens
+            // is_token_in_rank [num_tokens, num_ranks]
             int count = 0;
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32)
                 count += is_token_in_rank[i * kNumRanks + dst_rank];
             count = warp_reduce_sum(count);
+
+            // 一个warp中的第一个线程写入结果
             if (elect_one_sync())
+                // channel 发送到 rank 上面的数量前缀和
+                // channel_prefix_matrix shape [num_ranks, num_channels]
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
         __syncthreads();
@@ -194,6 +213,8 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+// 每个block 768个线程
+// kNumTMABytesPerWarp warp level TMA 缓冲区大小
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
@@ -222,6 +243,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            int num_recv_buffer_tokens) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
+    // 偶数sm 负责发送，奇数sm 负责接收，每两个sm 负责一个channel
     const bool is_sender = sm_id % 2 == 0;
     EP_DEVICE_ASSERT(num_sms % 2 == 0);
 
@@ -242,6 +264,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
     auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[is_sender ? responsible_rank : rank]) +
                                        kNumRanks * kNumRanks * sizeof(int));
+    // target rank 表明数据的rank 来源
+    //
     int target_rank = is_sender ? rank : responsible_rank;
     auto num_channels_total = num_channels * kNumRanks;
     auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
@@ -303,8 +327,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
+        // 负责每个rank的第一个thread写入channel的起始和结束位置
         if (send_warp_id_in_rank == 0 and elect_one_sync()) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
+            // 标注当前rank和当前channel的起始和结束位置
             st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
             value = channel_prefix_matrix[responsible_rank * num_channels + responsible_channel];
             st_relaxed_sys_global(channel_end_offset.buffer(), -value - 1);
@@ -324,6 +350,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             if (elect_one_sync()) {
                 while (true) {
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                    // 计算当前有多少可用的位置
                     int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
                     if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
                         break;
@@ -341,7 +368,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the
                 // following data
+                // 每个warp 负责发送一个token
                 if (token_idx % num_send_warps_per_rank == send_warp_id_in_rank and elect_one_sync())
+                    // 这里的send head 记录的是cached_channel_tail_idx呀
                     send_head[token_idx * kNumRanks + responsible_rank] =
                         is_token_in_rank[token_idx * kNumRanks + responsible_rank] ? cached_channel_tail_idx : -1;
 
@@ -357,6 +386,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                     // Copy data
                     auto shifted_channel_x_buffers = channel_x_buffers.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
+                    // unroll factor，lain id，destnation，soruce，load func，store func
                     UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
 
                     // Copy source index
@@ -364,6 +394,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
 
                     // Copy `topk_idx` and `topk_weights` with transformed index
+                    // 这里 topk 是不能够大于32的
                     if (lane_id < num_topk) {
                         // Top-k index
                         int recv_expert_begin = responsible_rank * num_experts_per_rank,
@@ -393,6 +424,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             // Move tail index
             // NOTES: here all warps should share the same new tail
             asm volatile("bar.sync %0, %1;" ::"r"(responsible_rank), "r"(num_threads_per_rank));
+            // 这里用普通的值去进行初始化一个atomic变量，之后再进行release语义的存储
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), cached_channel_tail_idx);
         }
@@ -403,21 +435,26 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         const auto recv_thread_id = thread_id;
         const auto recv_thread_id_in_rank = recv_thread_id % num_threads_per_rank;
         const auto recv_warp_id_in_rank = recv_thread_id_in_rank / 32;
+        // intranode 的EP size 要小于等于32？
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
         // Calculate offset first
+        // 这个offset 是为了什么呢？
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
 
         // Receive channel offset
         int total_offset, num_tokens_to_recv;
+        // 这里是sync 的level 应该就是warp？
         if (elect_one_sync()) {
             while ((total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0)
                 ;
             while ((num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0)
                 ;
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
+            // 负责每个rank的第0个warp
+            // rank* channel 记录每个rank-channel 对应的offset
             if (recv_warp_id_in_rank == 0)
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
@@ -609,6 +646,12 @@ void dispatch(void* recv_x,
 #undef DISPATCH_LAUNCH_CASE
 }
 
+// grid size: 1 + num_channels
+// 
+// 清理IPC Buffer，为combine阶段准备干净的通信缓冲区
+// 补全 send head 数组，为那些没有发送数据的token填充合理的head index
+// 最后同步每个rank
+
 template <int kNumRanks>
 __global__ void cached_notify_combine(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
@@ -688,25 +731,29 @@ void cached_notify_combine(void** buffer_ptrs,
 #undef CACHED_NOTIFY_COMBINE
 }
 
+// grid_size = num_sms = channel * 2
+// block size = 768
 template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
-__global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
-                                                          float* recv_topk_weights,
-                                                          const dtype_t* x,
-                                                          const float* topk_weights,
-                                                          const dtype_t* bias_0,
-                                                          const dtype_t* bias_1,
-                                                          const int* src_idx,
-                                                          const int* rank_prefix_matrix,
-                                                          const int* channel_prefix_matrix,
-                                                          int* send_head,
-                                                          int num_tokens,
-                                                          int num_recv_tokens,
-                                                          int hidden,
-                                                          int num_topk,
-                                                          void** buffer_ptrs,
-                                                          int rank,
-                                                          int num_max_send_tokens,
-                                                          int num_recv_buffer_tokens) {
+__global__ void __launch_bounds__(kNumThreads, 1) combine(
+    dtype_t* recv_x,                        // [num_tokens, hidden] 归约后的最终输出
+    float* recv_topk_weights,               // [num_tokens, num_topk] 归约后的权重
+    const dtype_t* x,                       // [num_recv_tokens, hidden] 当前 rank 的 expert 输出
+    const float* topk_weights,              // [num_recv_tokens, num_topk] expert 权重
+    const dtype_t* bias_0,                  // [num_tokens, hidden] 可选的 bias
+    const dtype_t* bias_1,                  // [num_tokens, hidden] 可选的 bias
+    const int* src_idx,                     // [num_recv_tokens] 每个 token 的原始索引
+    const int* rank_prefix_matrix,          // [num_ranks, num_ranks] rank 间前缀和
+    const int* channel_prefix_matrix,       // [num_ranks, num_channels] channel 前缀和
+    int* send_head,                         // [num_recv_tokens, num_ranks] dispatch 阶段记录的队列位置
+    int num_tokens,                         // 原始 token 总数
+    int num_recv_tokens,                    // 当前 rank 接收的 token 数
+    int hidden,
+    int num_topk,
+    void** buffer_ptrs,
+    int rank,
+    int num_max_send_tokens,
+    int num_recv_buffer_tokens) {
+    // 偶数sm 从local -> buffer sender, 奇数sm 从buffer -> local recver
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
@@ -737,6 +784,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         const auto num_threads_per_rank = num_send_warps_per_rank * 32;
         const auto send_thread_id = thread_id;
         const auto send_warp_id = send_thread_id / 32;
+        // 发送到的目标rank的id
         const auto send_rank_id = (responsible_channel + send_warp_id) % kNumRanks;
         const auto send_warp_id_in_rank = send_warp_id / kNumRanks;
         EP_STATIC_ASSERT(num_send_warps * 32 == kNumThreads, "Invalid warp count");
@@ -778,9 +826,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
+            // 检查target buffer 是否有足够的空间存放即将发送的数据
             if (elect_one_sync()) {
                 while (true) {
+                    // 由于不同的warp 负责的是不同的rank，所以这里需要让每个warp去检查slot是否有空位
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                    // load volatile global 编译器无法重排或者删除合并之类的优化，并且bypass l1
                     int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
                     if (num_recv_buffer_tokens - num_used_slots >= num_round_tokens)
                         break;
@@ -818,6 +869,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
+            // ok 这个地方其实是一个round/max_token_chunk发送完成之后 issue 一次flag
             asm volatile("bar.sync %0, %1;" ::"r"(send_rank_id), "r"(num_threads_per_rank));
             if (send_warp_id_in_rank == 0 and elect_one_sync())
                 st_release_sys_global(channel_tail_idx.buffer(), current_channel_tail_idx);
@@ -831,8 +883,13 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         EP_DEVICE_ASSERT(thread_id >= 0 and kNumThreads % 32 == 0);
 
         // Shared head, tail and retired flags for receiver warps
+        // Warp w 在 Rank r 的 buffer 中消费到的位置
+        // 消费者的 head idx，每个warp维护一份，每个warp是copy的最小单位
+        // recv 阶段每个warp 要看到所有的rank，每个warp负责一个token，但是这个token的来源可以是所有rank
         __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks];
+        // 每个rank的 tail idx，由生产者决定所有warp 看到的应该是一致的，所以只需要kNumRanks个
         __shared__ volatile int channel_tail_idx[kNumRanks];
+        // 监控每个reducer warp 是否已经完成任务
         __shared__ volatile bool warp_retired[num_recv_warps];
         if (thread_id < num_recv_warps)
             warp_retired[thread_id] = false;
@@ -841,9 +898,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         if (thread_id < kNumRanks)
             channel_tail_idx[thread_id] = 0;
         asm volatile("bar.sync 0, %0;" ::"r"(kNumThreads));
-
+        // warp0 作为scheduler，主要负责和sender 维护head/tail 指针的同步
         if (thread_id < 32) {
+            // head_idx_ptr = channel * ranks
             int* channel_head_idx_ptr = static_cast<int*>(buffer_ptrs[rank]) + responsible_channel * kNumRanks + lane_id;
+            // tail_idx_ptr = head_idx_ptr + channel * ranks
             int* channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
 
             // Queue head updater

@@ -7,20 +7,22 @@ namespace deep_ep {
 namespace layout {
 
 template <int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
-__global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
-                                    int* num_tokens_per_rank,
-                                    int* num_tokens_per_rdma_rank,
-                                    int* num_tokens_per_expert,
-                                    bool* is_token_in_rank,
-                                    int num_tokens,
-                                    int num_topk,
+__global__ void get_dispatch_layout(const topk_idx_t* topk_idx,         // 路由结果
+                                    int* num_tokens_per_rank,           // 每个rank 的token数
+                                    int* num_tokens_per_rdma_rank,      // 每个RDMA rank的token数
+                                    int* num_tokens_per_expert,         // 每个expert 的token数
+                                    bool* is_token_in_rank,             // 每个 token是否发送给某个rank
+                                    int num_tokens,                     // 总的token数量
+                                    int num_topk,                       
                                     int num_ranks,
                                     int num_experts) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
 
+    // 这个kernel的 slm 压力比较大，后续应该看一下如何tune kernel
     // Count expert statistics
     __shared__ int num_tokens_per_expert_per_thread[kNumThreads][kNumExpertsPerSM];
+    // 当前SM 负责的expert 范围
     int expert_begin_idx = sm_id * kNumExpertsPerSM, expert_end_idx = min(expert_begin_idx + kNumExpertsPerSM, num_experts);
     if (expert_begin_idx < expert_end_idx) {
         // Per-thread count
@@ -28,6 +30,7 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
         for (int i = 0; i < kNumExpertsPerSM; ++i)
             num_tokens_per_expert_per_thread[thread_id][i] = 0;
         #pragma unroll
+        // 每个thread load 一行 top_idx，然后检查里面的expert_idx
         for (int i = thread_id; i < num_tokens; i += kNumThreads) {
             auto shifted_topk_idx = topk_idx + i * num_topk;
             #pragma unroll
@@ -40,6 +43,10 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
         __syncthreads();
 
         // Sum up
+        // 假设说每个 SM 负责 4个 expert，则只有4个 thread 干活
+        // thread 0 负责 local expert 0
+        // thread 1 负责 local expert 1
+        // ...
         EP_STATIC_ASSERT(kNumExpertsPerSM <= kNumThreads, "Too many experts per SM");
         if (expert_begin_idx + thread_id < expert_end_idx) {
             int sum = 0;
@@ -130,6 +137,11 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
                          int num_ranks,
                          int num_experts,
                          cudaStream_t stream) {
+    // 每个block 的线程数
+    // 每个SM 处理的expert 数量
+    // 每个SM 处理的rank 数量
+    // 前面的若干个SM 处理expert的统计，后面的若干个SM 处理Rank统计
+    // 这几个参数 是不是可调的，不理解为什么设定为现在的样子呢
     constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
     int num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) + (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
     EP_STATIC_ASSERT(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of ranks per SM");

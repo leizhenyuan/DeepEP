@@ -8,14 +8,27 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
 #include <tuple>
 #include <vector>
 
-#include "config.hpp"
-#include "event.hpp"
+
+
+#ifdef USE_CUDA
 #include "kernels/configs.cuh"
 #include "kernels/exception.cuh"
+#include "config.hpp"
+#endif
+
+#ifdef USE_XPU
+#include <level_zero/ze_api.h>
+#include "sycl/configs.h"
+#include "sycl/config.hpp"
+#endif
+
+// Event header is shared between CUDA and XPU
+#include "event.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME deep_ep_cpp
@@ -24,8 +37,13 @@
 namespace shared_memory {
 
 union MemHandleInner {
+    // 节点内部通信进程句柄
+#ifdef USE_CUDA
     cudaIpcMemHandle_t cuda_ipc_mem_handle;
     CUmemFabricHandle cu_mem_fabric_handle;
+#elif defined(USE_XPU)
+    ze_ipc_mem_handle_t ze_ipc_mem_handle;
+#endif
 };
 
 struct MemHandle {
@@ -38,6 +56,12 @@ constexpr size_t HANDLE_SIZE = sizeof(MemHandle);
 class SharedMemoryAllocator {
 public:
     SharedMemoryAllocator(bool use_fabric);
+#ifdef USE_XPU
+    // XPU: 使用外部传入的 SYCL queue 初始化，确保使用正确的设备
+    SharedMemoryAllocator(bool use_fabric, sycl::queue& queue);
+    // XPU: 延迟初始化，在 Buffer 创建 comm_stream 后调用
+    void init_from_queue(sycl::queue& queue);
+#endif
     void malloc(void** ptr, size_t size);
     void free(void* ptr);
     void get_mem_handle(MemHandle* mem_handle, void* ptr);
@@ -46,6 +70,10 @@ public:
 
 private:
     bool use_fabric;
+#ifdef USE_XPU
+    ze_context_handle_t ze_context = nullptr;
+    ze_device_handle_t ze_device = nullptr;
+#endif
 };
 }  // namespace shared_memory
 
@@ -81,7 +109,11 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
+#ifdef USE_CUDA
     at::cuda::CUDAStream comm_stream;
+#elif defined(USE_XPU)
+    sycl::queue comm_stream;
+#endif
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -123,6 +155,7 @@ public:
            bool use_fabric);
 
     ~Buffer() noexcept(false);
+
 
     bool is_available() const;
 
@@ -199,6 +232,14 @@ public:
         bool async,
         bool allocate_on_comm_stream);
 
+    // Platform-specific methods
+#ifdef USE_CUDA
+    // CUDA-specific methods
+    pybind11::bytearray get_local_nvshmem_unique_id() const;
+    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
+    torch::Stream get_comm_stream() const;
+
+    // NVSHMEM-based internode communication (CUDA only)
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -295,6 +336,51 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+
+#elif defined(USE_XPU)
+    // XPU-specific methods
+    sycl::queue get_comm_queue() const;
+    torch::Tensor get_remote_buffer_tensor(int target_rank, const pybind11::object& dtype, int64_t offset) const;
+    
+    // XPU IPC handle exchange using Ring AllGather pattern
+    // Returns all gathered IPC handles from all ranks via Unix socket file descriptor passing
+    std::vector<std::optional<pybind11::bytearray>> all_gather_handle(
+        const pybind11::bytearray& local_ipc_handle,
+        const pybind11::function& barrier_func);
+    
+    // IPC mapping test methods - 用于测试 IPC 地址映射是否正确
+    // test_ipc_write: 写入测试值 rank*1000+thread_id 到 barrier_signal_ptrs[rank]+thread_id
+    // test_ipc_read: 读取 barrier_signal_ptrs[thread_id]+rank 并验证值是否为 thread_id*1000+rank
+    void test_ipc_write();
+    void test_ipc_read();
+    
+    // test_barrier: 测试 barrier_block_cas 跨 GPU 同步
+    // process_group: 可选的 PyTorch 分布式 process group，用于 CPU barrier 同步
+    void test_barrier(const std::optional<c10::intrusive_ptr<c10d::ProcessGroup>>& process_group = std::nullopt);
+    
+    // test_barrier_stress: barrier + IPC data verification stress test
+    // Returns error_count (0 = all passed)
+    int test_barrier_stress(int inner_repeat, int iter_offset, int data_size);
+
+    // test_barrier_perf: pure barrier performance test (no data verification)
+    void test_barrier_perf(int inner_repeat);
+    
+    // test_notify_dispatch: 直接测试 notify_dispatch 内核
+    // 返回: (moe_recv_count, expert_counts, rank_prefix_matrix, channel_prefix_matrix)
+    std::tuple<int, std::vector<int>, torch::Tensor, torch::Tensor> test_notify_dispatch(
+        const torch::Tensor& num_tokens_per_rank,
+        const torch::Tensor& num_tokens_per_expert,
+        const torch::Tensor& is_token_in_rank,
+        int num_tokens,
+        int num_experts,
+        int num_channels,
+        int expert_alignment);
+    
+    // Future: XPU internode communication methods when ISHMEM is ready
+    // std::tuple<...> internode_dispatch(...);  // TODO: Implement with ISHMEM
+    // std::tuple<...> internode_combine(...);   // TODO: Implement with ISHMEM
+
+#endif
 };
 
 }  // namespace deep_ep

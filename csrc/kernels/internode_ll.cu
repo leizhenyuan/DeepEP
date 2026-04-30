@@ -127,33 +127,33 @@ void clean_low_latency_buffer(int* clean_0,
 }
 
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
-__global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
-                                                    void* packed_recv_x_scales,
-                                                    int* packed_recv_src_info,
-                                                    int64_t* packed_recv_layout_range,
-                                                    int* packed_recv_count,
+__global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,                        // 接收数据的缓冲区 [num_local_experts, num_ranks * max_tokens, hidden]
+                                                    void* packed_recv_x_scales,                 // FP8缩放因子缓冲区（可选）
+                                                    int* packed_recv_src_info,                  // 记录每个token的源位置信息
+                                                    int64_t* packed_recv_layout_range,          // 每个专家从各rank接收的token范围
+                                                    int* packed_recv_count,                     // 每个本地专家接收到的token总数
                                                     int* mask_buffer_ptr,
                                                     int* cumulative_local_expert_recv_stats,
                                                     int64_t* dispatch_wait_recv_cost_stats,
-                                                    void* rdma_recv_x,
-                                                    int* rdma_recv_count,
-                                                    void* rdma_x,
-                                                    const void* x,
-                                                    const topk_idx_t* topk_idx,
+                                                    void* rdma_recv_x,                          // RDMA接收缓冲区（跨节点通信用）
+                                                    int* rdma_recv_count,                       // RDMA接收计数器
+                                                    void* rdma_x,                               // RDMA发送缓冲区（跨节点通信用）
+                                                    const void* x,                              // 原始token数据 [num_tokens, hidden_size]
+                                                    const topk_idx_t* topk_idx,                 // Top-K专家路由索引 [num_tokens, num_topk]
                                                     int* atomic_counter_per_expert,
                                                     int* atomic_finish_counter_per_expert,
                                                     int* next_clean,
                                                     int num_next_clean_int,
-                                                    int num_tokens,
+                                                    int num_tokens,                             // 当前批次的token数量
                                                     int num_max_dispatch_tokens_per_rank,
-                                                    int num_topk,
-                                                    int num_experts,
-                                                    int rank,
-                                                    int num_ranks,
+                                                    int num_topk,                               // Top-K值
+                                                    int num_experts,                            // 总专家数
+                                                    int rank,                                   // 当前rank
+                                                    int num_ranks,                              // 总rank数
                                                     int num_warp_groups,
                                                     int num_warps_per_group,
                                                     bool round_scale,
-                                                    int phases) {
+                                                    int phases) {                               // 执行阶段控制 (SEND_PHASE | RECV_PHASE)
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();

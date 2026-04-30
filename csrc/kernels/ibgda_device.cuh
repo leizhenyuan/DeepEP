@@ -72,6 +72,7 @@ typedef struct {
 } __attribute__((__packed__)) ibgda_atomic_32_masked_fa_seg_t;
 
 __device__ static __forceinline__ nvshmemi_ibgda_device_state_t* ibgda_get_state() {
+    // 从nvshmem里面拿到的
     return &nvshmemi_ibgda_device_state_d;
 }
 
@@ -110,6 +111,7 @@ __device__ static __forceinline__ void ibgda_lock_release(int* lock) {
     st_na_relaxed(lock, 0);
 }
 
+// 通过asm 更新ibgda的doorbell 寄存器
 __device__ static __forceinline__ void ibgda_update_dbr(nvshmemi_ibgda_device_qp_t* qp, uint32_t dbrec_head) {
     // `DBREC` contains the index of the next empty `WQEBB`
     __be32 dbrec_val;
@@ -127,6 +129,7 @@ __device__ static __forceinline__ void ibgda_update_dbr(nvshmemi_ibgda_device_qp
     st_na_release(dbrec_ptr, dbrec_val);
 }
 
+// 通过ibgda 让 ib更新网卡
 __device__ static __forceinline__ void ibgda_ring_db(nvshmemi_ibgda_device_qp_t* qp, uint16_t prod_idx) {
     auto bf_ptr = reinterpret_cast<uint64_t*>(qp->tx_wq.bf);
     ibgda_ctrl_seg_t ctrl_seg = {.opmod_idx_opcode = HtoBE32(prod_idx << 8), .qpn_ds = HtoBE32(qp->qpn << 8)};
@@ -213,7 +216,13 @@ __device__ static __forceinline__ void ibgda_write_rdma_write_inl_wqe(
 }
 
 __device__ static __forceinline__ uint64_t
-ibgda_get_lkey_and_rkey(uint64_t laddr, __be32* lkey, uint64_t raddr, int dst_pe, uint64_t* out_raddr, __be32* out_rkey, uint32_t dev_idx) {
+ibgda_get_lkey_and_rkey(uint64_t laddr,     // 本地虚拟地址
+                        __be32* lkey,       // 输出本地内存密钥
+                        uint64_t raddr,     // 远程虚拟地址
+                        int dst_pe,         // 远程PE
+                        uint64_t* out_raddr,    // 输出远程物理地址
+                        __be32* out_rkey,   // 输出远程内存密钥
+                        uint32_t dev_idx) { // 设备索引
     auto state = ibgda_get_state();
     auto heap_start = reinterpret_cast<uint64_t>(nvshmemi_device_state_d.heap_base);
     auto log2_cumem_granularity = state->log2_cumem_granularity;
@@ -342,9 +351,16 @@ __device__ static __forceinline__ void ibgda_write_empty_recv_wqe(void* out_wqe)
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
 }
 
+// warp level non-blocking put
 template <bool kAlwaysDoPostSend = false>
 __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
-    uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx) {
+    uint64_t req_rptr,     // Remote pointer 
+    uint64_t req_lptr,      // Local pointer
+    size_t bytes,   // bytes
+    int dst_pe,     // Destination PE
+    int qp_id,      // Queue pair ID
+    int lane_id,    // Lane ID （warp 内部的lane id）
+    int message_idx) {
     // Get lkey and rkey, store them into lanes
     uint32_t num_wqes = 0;
     __be32 my_lkey = 0;
@@ -435,6 +451,7 @@ __device__ static __forceinline__ void ibgda_write_amo_add_wqe(nvshmemi_ibgda_de
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<int4*>(&data_seg));
 }
 
+// 通过RDMA原子的将一个值加到远程内存的地址上，不获取旧值
 __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     void* rptr, const int& value, int pe, int qp_id, bool is_local_copy = false) {
     if (is_local_copy) {
@@ -496,6 +513,7 @@ __device__ static __forceinline__ void ibgda_poll_cq(nvshmemi_ibgda_device_cq_t*
 }
 
 // Wait until wqe `idx - 1` is completed.
+// 等待指定QP 上的RDMA操作完成
 __device__ static __forceinline__ void nvshmemi_ibgda_quiet(int dst_pe, int qp_id) {
     auto qp = ibgda_get_rc(dst_pe, qp_id);
     auto state = ibgda_get_state();

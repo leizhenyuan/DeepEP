@@ -72,6 +72,8 @@ int init(const std::vector<uint8_t>& root_unique_id_val, int rank, int num_ranks
     return nvshmem_my_pe();
 }
 
+// 这里会隐式的调用一个barrier all 在nvshmem align exit的时候
+// 每个PE 上面分配的ptr size如果不同会导致未定义行为
 void* alloc(size_t size, size_t alignment) {
     return nvshmem_align(alignment, size);
 }
@@ -80,6 +82,8 @@ void free(void* ptr) {
     nvshmem_free(ptr);
 }
 
+// nvshmem_barrier_all ensures completion of all previously issued memory stores and remote memory updates 
+// issued NVSHMEMAMOs and RMA routine calls such as nvshmem_int_add, nvshmem_put32, nvshmem_put_nbi, and nvshmem_get_nbi.
 void barrier() {
     nvshmem_barrier_all();
 }

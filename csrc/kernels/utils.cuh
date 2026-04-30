@@ -60,7 +60,7 @@ struct PatternVisitor {
 
     __device__ __host__ auto operator[](const uint32_t& i) { return func(i); }
 };
-
+// pattern:  指令:输出:输入:clobber（用来提示编译器这条内联汇编会破坏哪些输入输出以外的资源）
 __device__ __forceinline__ void trap() {
     asm("trap;");
 }
@@ -501,12 +501,14 @@ __forceinline__ __device__ out_dtype_t extract_required_scale_format(float value
     }
 }
 
+// todo: summer behaviour and usage
 template <int kNumRanks, bool kSyncOnly = false>
 __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int rank) {
     auto thread_id = static_cast<int>(threadIdx.x);
 
     // For non-sync-only cases, the memory operations by other threads in the block must be visible to the `sys` scope
     if constexpr (not kSyncOnly) {
+        // system level acquire-release fence
         memory_fence();
         __syncthreads();
     }
@@ -521,7 +523,9 @@ __forceinline__ __device__ void barrier_block(int** barrier_signal_ptrs, int ran
     // Check timeout
     auto start_time = clock64();
     while (true) {
+        // global volatile load 为了显存一致性
         auto value = thread_id < kNumRanks ? ld_volatile_global(barrier_signal_ptrs[rank] + thread_id) : 0;
+        // 为什么会小于0呢？
         if (__all_sync(0xffffffff, value <= 0))
             break;
 
