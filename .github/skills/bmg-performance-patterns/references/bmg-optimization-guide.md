@@ -19,7 +19,23 @@ The intranode path is PCIe-limited. Optimization strategy:
 1. Maximize transfer granularity — avoid many small transfers
 2. Use 128-byte (2 cache line) aligned transfers where possible
 3. Write directly from GPU global memory to IPC peer memory — no SLM staging needed
-4. Profile: is the bottleneck PCIe bandwidth or kernel overhead?
+4. **Verify PCIe Max Payload Size (MPS)**: insufficient MPS causes PCIe TLP fragmentation and severe bandwidth degradation. Check and align MPS across the PCIe switch, GPU, and NIC:
+   ```bash
+   # Check current MPS for all PCIe devices
+   sudo lspci -vvv | grep -i "maxpayload\|MaxPayload"
+   # Or per-device:
+   sudo setpci -s <BDF> CAP_EXP+8.w
+   ```
+   All devices under the same PCIe switch should use the same MPS (typically 256 B or 512 B).
+5. **Consider Level Zero DMA copy** (`zeCommandListAppendMemoryCopy`) instead of kernel-driven copy for large bulk transfers — DMA engines operate independently of EU occupancy and can achieve higher effective PCIe bandwidth:
+   ```cpp
+   // Level Zero DMA copy (host-initiated, async)
+   zeCommandListAppendMemoryCopy(cmdList, dst, src, size,
+                                  nullptr, 0, nullptr);
+   zeCommandListClose(cmdList);
+   zeCommandQueueExecuteCommandLists(queue, 1, &cmdList, fence);
+   ```
+6. Profile: is the bottleneck PCIe bandwidth, MPS fragmentation, or kernel launch overhead?
 
 **PCIe Gen 5 x16 theoretical**: ~128 GB/s bidirectional
 **Realistic achievable**: 60-80 GB/s (DMA), 40-60 GB/s (kernel-driven)
@@ -33,14 +49,27 @@ Optimization strategy:
 3. Overlap: use `ishmem_*_nbi` and do local work while transfer is in flight
 4. Avoid unnecessary `ishmem_barrier_all()` — use `ishmem_quiet()` where possible
 
-**MLX InfiniBand HDR100**: ~100 Gb/s bandwidth, ~2 µs latency (estimated)
+**MLX NIC specs — run on target node to get actual values:**
+```bash
+# NIC model and PCIe slot info
+lspci | grep -i mellanox
 
-### Priority 3: Compute Efficiency
+# Link speed and width (replace 'mlx5_0' with actual device name)
+ibstat mlx5_0 | grep -E "CA type|State|Physical state|Rate|Link layer"
 
-For the actual MoE token dispatch computation:
-1. Ensure work-groups are large enough to hide memory latency (≥ 128 work-items)
-2. Avoid SLM bank conflicts (32-bit banks on Intel, 16 banks per Xe2-core)
-3. Use `[[intel::reqd_sub_group_size(16)]]` to prevent unexpected SIMD fragmentation
+# Active port rate (in Gb/s)
+cat /sys/class/infiniband/mlx5_0/ports/1/rate
+```
+
+### Priority 3: Memory Access Efficiency
+
+DeepEP kernels are memory-bound (scatter/gather, IPC copy, layout rearrangement) — there is
+no significant compute. Optimization strategy focuses on maximizing memory throughput:
+1. Use large enough work-groups to issue enough in-flight memory requests (≥ 128 work-items)
+2. Ensure coalesced global memory access — sequential work-item lanes should access sequential addresses
+3. Use vectorized load/store for all copy paths — prefer `sycl::vec<uint32_t, 4>` (128-bit) or `sycl::vec<uint32_t, 8>` (256-bit) per work-item to saturate PCIe/HBM bandwidth
+4. Avoid SLM bank conflicts if SLM is used for index/offset staging
+5. Use `[[intel::reqd_sub_group_size(32)]]` to prevent SIMD fragmentation and maintain coalescing
 
 ## Work-Group Size Recommendation Matrix
 
@@ -80,58 +109,25 @@ constexpr int SLM_ROW = 32 + 1;  // 33 instead of 32 floats per row
 
 BMG's 512-bit vector engine works best with 16x FP32 or 8x FP64 operations.
 
+For DeepEP copy kernels (intranode IPC copy, layout rearrangement), always use vectorized
+load/store to maximize memory bus utilization:
+
 ```cpp
-// Preferred: 16-wide float operations (matches SIMD16 sub-group)
-sycl::vec<float, 16> data;
+// Preferred copy pattern: 128-bit (4x uint32) per work-item
+using vec4u32 = sycl::vec<uint32_t, 4>;
+vec4u32 chunk = *reinterpret_cast<const vec4u32*>(src + i);
+*reinterpret_cast<vec4u32*>(dst + i) = chunk;
 
-// Also good: 4-wide float (cache-line-aligned load)
-sycl::vec<float, 4> chunk;
+// Even better if alignment allows: 256-bit (8x uint32) per work-item
+using vec8u32 = sycl::vec<uint32_t, 8>;
+```
 
-// Avoid: scalar loads in loops (prevents auto-vectorization)
+```cpp
+// Avoid: scalar word-by-word copy — leaves vector engine idle
 for (int i = 0; i < N; i++)
-    local_data[i] = ptr[base + i];  // ← hard to vectorize
+    dst[i] = src[i];  // ← scalar, not vectorized
 ```
 
-## Profiling Guide for DeepEP on B60/B70
-
-### Step 1: Identify Bottleneck Type
-
-```bash
-# Quick pass: is it compute or memory bound?
-vtune -collect gpu-hotspots -knob enable-characterization-insights=true \
-      -- ./deepep_bench --mode intranode
-
-# Check "GPU Compute/Memory Bound" metrics in VTune GUI
-```
-
-### Step 2: Memory Access Analysis
-
-```bash
-# Check global memory access efficiency (coalescing)
-vtune -collect gpu-hotspots \
-      -knob collect-memory-bandwidth=true \
-      -- ./deepep_bench --mode intranode
-```
-
-### Step 3: Communication Profiling
-
-```bash
-# Profile ishmem communication overhead
-unitrace --level-zero --device-timing --host-timing \
-         --output-dir ./traces \
-         -- mpirun -np 2 ./deepep_bench --mode internode
-
-# Check: how much time is in ishmem_quiet() vs actual data transfer?
-```
-
-### Step 4: SLM and Register Analysis
-
-```bash
-# Intel Advisor: memory footprint and register pressure
-advisor --collect=survey --static-instruction-mix \
-        --project-dir=./advisor_out \
-        -- ./deepep_bench
-```
 
 ## Performance Target Template
 
@@ -140,8 +136,8 @@ Fill in after hardware testing:
 | Metric | Target | Measured | Δ vs Target | Notes |
 |---|---|---|---|---|
 | Intranode BW (B60 pair) | >60 GB/s | TBD | — | PCIe Gen5 x16 |
-| Internode latency (4 KB) | <5 µs | TBD | — | MLX HDR100 |
-| Internode BW (1 MB) | >10 GB/s | TBD | — | MLX HDR100 |
+| Internode latency (4 KB) | TBD | TBD | — | run ibstat on target node |
+| Internode BW (1 MB) | TBD | TBD | — | run ibstat on target node |
 | E2E MoE dispatch (256 tokens, 8 experts) | <50 µs | TBD | — | Single node |
 | E2E MoE dispatch (256 tokens, 8 experts) | <100 µs | TBD | — | 2-node |
 

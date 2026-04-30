@@ -96,16 +96,18 @@ For intranode data transfers via Level Zero IPC:
 
 When loading aligned, consecutive data:
 ```cpp
-// Use SYCL vec for vectorized loads (4x floats = 16 bytes = quarter cache line)
-using float4 = sycl::vec<float, 4>;
-float4 data = *reinterpret_cast<const float4*>(src + base_offset);
+// Use SYCL vec for vectorized loads — 128-bit (4x uint32) per work-item
+using vec4u32 = sycl::vec<uint32_t, 4>;
+vec4u32 chunk = *reinterpret_cast<const vec4u32*>(src + base_offset);
+*reinterpret_cast<vec4u32*>(dst + base_offset) = chunk;
 
-// Or use ESIMD for more control (Intel extension)
-#include <sycl/ext/intel/esimd.hpp>
-namespace esimd = sycl::ext::intel::esimd;
-esimd::simd<float, 16> vec_data;
-vec_data.copy_from(ptr + offset);  // 16 floats = 64 bytes = 1 cache line
+// 256-bit (8x uint32) when 32-byte alignment is guaranteed
+using vec8u32 = sycl::vec<uint32_t, 8>;
+vec8u32 wide = *reinterpret_cast<const vec8u32*>(src + base_offset);
 ```
+
+All copy paths (IPC peer copy, layout rearrangement, token scatter/gather) must use
+vectorized load/store — scalar element-by-element copy leaves PCIe bandwidth unused.
 
 ### 6. ishmem Performance Tuning
 
@@ -173,6 +175,27 @@ unitrace --level-zero --device-timing --host-timing -- ./build/deepep_test
 advisor --collect=survey --project-dir=./advisor_results -- ./build/deepep_test
 advisor --collect=tripcounts --flop --project-dir=./advisor_results -- ./build/deepep_test
 ```
+
+## Output Report Requirement
+
+After completing any optimization pass, always output a summary report to the user.
+The report must cover every change made in that pass:
+
+```
+### BMG Optimization Update — <date or pass name>
+
+| # | Area | Change | Rationale |
+|---|------|--------|-----------|
+| 1 | Intranode copy | Switched to vec8u32 load/store | Saturate PCIe bandwidth |
+| 2 | Work-group size | Increased from 64 to 128 | More in-flight memory requests |
+| ... | ... | ... | ... |
+
+Open questions / items needing hardware validation:
+- [ ] Measured MPS on target node?
+- [ ] DMA vs kernel copy bandwidth comparison done?
+```
+
+Do not skip the report even for single-item changes.
 
 ## See Also
 
