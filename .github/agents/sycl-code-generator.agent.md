@@ -15,6 +15,10 @@ reimplements all functionality on Intel B60/B70 (Battlemage/BMG) GPUs.
   - `docs/porting/03_kernel_analysis.md`
 - DO NOT guess at memory ordering semantics — only use semantics verified in the analysis docs
 - DO NOT implement ishmem operations without referencing ishmem API documentation
+- **CUDA→SYCL translation**: use built-in knowledge for well-known API mappings. If the SYCL
+  equivalent of a CUDA call is uncertain (no clear 1:1 mapping, behavior difference suspected,
+  or API not in common knowledge), **stop and ask the user** before writing any code for that
+  construct. Do not guess and do not silently substitute a weaker API.
 - STOP IMMEDIATELY if any of these are unclear or missing from analysis docs:
   - BMG sub-group size (critical for all warp-equivalent operations)
   - ishmem quiet/fence behavioral semantics relative to NVSHMEM
@@ -118,9 +122,35 @@ For IPC handle management in `layout.cpp`:
 - Document the lifecycle: alloc → get handle → export → import → use → close
 - Note PCIe coherence guarantees vs NVLink (may differ)
 
+### Step 8 — Port Python Binding Layer
+
+After all `csrc_sycl/` files are written, update the binding layer in-place:
+
+**`csrc/deep_ep.hpp`** — replace CUDA types:
+- `cudaStream_t` → `sycl::queue*`
+- `CUipcMemHandle` / `cudaIpcMemHandle_t` → `ze_ipc_mem_handle_t`
+- CUDA event types → `sycl::event`
+- `#include <cuda*.h>` → `#include <sycl/sycl.hpp>` + Level Zero headers
+
+**`csrc/deep_ep.cpp`** — replace CUDA runtime usage:
+- `at::cuda::getCurrentCUDAStream()` → `at::xpu::getCurrentXPUStream().queue()`
+- Any CUDA stream/event sync calls → SYCL equivalents
+- `torch.Tensor.data_ptr()` still works for SYCL USM pointers — no change needed
+
+**`setup.py` / `CMakeLists.txt`** — update build system:
+- Compiler: `nvcc` → `icpx`
+- Flags: `-arch=sm_90` → `-fsycl -fsycl-targets=spir64_gen`
+- Libraries: `cuda`, `nvshmem` → `sycl`, `ishmem`, `ze_loader`
+
+> 🔴 HIGH RISK: `ze_ipc_mem_handle_t` serialization size/format differs from CUDA IPC handles —
+> stop and ask the user if the Python-side bytes object size assumption needs updating.
+
+If any CUDA call has no clear SYCL equivalent, stop and ask the user before proceeding.
+
 ## Output
 
 - All code files in `csrc_sycl/`
+- Updated `csrc/deep_ep.cpp`, `csrc/deep_ep.hpp`, `setup.py`, `CMakeLists.txt`
 - `docs/porting/03b_generation_notes.md` documenting:
   - Key design decisions made
   - Deviations from the original architecture

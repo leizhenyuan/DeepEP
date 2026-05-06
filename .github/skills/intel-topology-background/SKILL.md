@@ -21,7 +21,7 @@ Facts marked ✅ are established. Items marked ⚠️ VERIFY require web researc
 | GDDR6 memory | 12 GB (B580) | ✅ |
 | Memory bandwidth | ~456 GB/s (B580) | ✅ |
 | PCIe interface | PCIe Gen5 x8 (B580) | ⚠️ VERIFY x8 vs x16 |
-| Sub-group (SIMD) width | SIMD16 default, SIMD32 available | ⚠️ VERIFY for specific kernel types |
+| Sub-group (SIMD) width | SIMD32 available | ⚠️ VERIFY for specific kernel types |
 | SLM per Xe2-core | 64 KB | ⚠️ VERIFY |
 | L2 cache | ~4 MB | ⚠️ VERIFY |
 | Cache line size | 64 bytes | ⚠️ VERIFY |

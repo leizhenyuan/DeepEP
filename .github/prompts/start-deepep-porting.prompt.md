@@ -59,7 +59,7 @@ This agent dispatches the `cuda-kernel-reader` sub-agent for each kernel file:
 
 This agent reads Phase 1 and Phase 2 outputs, then generates:
 - Complete SYCL + Level Zero + ishmem implementation in `csrc_sycl/`
-- Uses `sycl-translation-patterns` and `ishmem-migration-guide` skills
+- Uses `ishmem-migration-guide` and `asm-translation-guide` skills
 
 **Expected outputs**:
 - `csrc_sycl/` (complete SYCL codebase)

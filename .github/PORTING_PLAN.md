@@ -13,7 +13,7 @@ No CUDA code is retained in the final implementation.
 | GPU | H100/A100 | Intel B60/B70 (Battlemage) |
 | Intranode comm | NVLink / CUDA IPC | PCIe + Level Zero IPC handles |
 | Internode comm | NVSHMEM + IBGDA + MLX NIC | ishmem + MLX NIC (GPU-initiated) |
-| Programming model | CUDA | SYCL (high-level) + Level Zero (low-level) |
+| Programming model | CUDA | SYCL (high-level) + Level Zero (low-level) + visa (asm) |
 | Code strategy | — | Complete SYCL rewrite — no CUDA retained, only functional at first step |
 
 ---
@@ -30,11 +30,13 @@ Phase 1: Analysis          Phase 2: Kernel Deep-Dive
 │ deepep-topology-   │────▶│  deepep-kernel-        │
 │    analyst         │     │     analyst             │
 │                    │     │                         │
-│ Skills (direct):   │     │ Sub-agents:             │
-│ • nvidia-topology-  │     │ • cuda-kernel-reader    │
-│   background        │     │   (per kernel file)     │
-│ • intel-topology-   │     │                         │
-│   background        │     │ Output:                 │
+│ Skills:            │     │ Skills:                 │
+│ • intel-topology-  │     │ • analyze-cuda-         │
+│   background       │     │   kernels               │
+│                    │     │ • asm-translation-      │
+│                    │     │   guide                 │
+│                    │     │                         │
+│                    │     │ Output:                 │
 │                    │     │ 03_kernel_analysis.md   │
 │ Output:            │     └──────────┬──────────────┘
 │ 01_topology_       │                │
@@ -57,28 +59,12 @@ Phase 3: SYCL Kernel Generation
 │ • asm-translation-     │
 │   guide                │
 │                        │
-│ Output: csrc_sycl/     │
+│ Output: csrc_sycl/ +   │
+│ csrc/ binding layer    │
 └──────────┬─────────────┘
            │
            ▼
-Phase 4: Python Binding Porting
-┌────────────────────────┐
-│ python-binding-        │
-│    porter              │
-│                        │
-│ Skills:                │
-│ • sycl-translation-    │
-│   patterns             │
-│ • intel-topology-      │
-│   background           │
-│                        │
-│ Output:                │
-│ deep_ep_sycl/          │
-│ (pybind11 + setup.py)  │
-└──────────┬─────────────┘
-           │
-           ▼
-Phase 5: Memory Model Verification
+Phase 4: Memory Model Verification
 ┌────────────────────────┐
 │ memory-model-verifier  │◀── HIGH RISK → stop immediately,
 │                        │               wait for human review
@@ -92,7 +78,7 @@ Phase 5: Memory Model Verification
 └──────────┬─────────────┘
            │
            ▼
-Phase 6: Report Generation
+Phase 5: Report Generation
 ┌────────────────────────┐
 │ porting-report-        │
 │    generator           │
@@ -114,9 +100,8 @@ For each phase: agent responsible, sub-agents invoked, and skills loaded.
 |------|--------|
 | **Agent** | `deepep-topology-analyst` |
 | **Sub-agents** | none |
-| **Skills loaded** | `nvidia-topology-background`, `intel-topology-background` |
+| **Skills loaded** | `intel-topology-background` |
 | **Additional tools** | web search to resolve ⚠️ VERIFY items in intel-topology-background |
-| **Reads** | `csrc/kernels/intranode.cu`, `csrc/kernels/ibgda_device.cuh`, `csrc/kernels/configs.cuh` |
 | **Writes** | `docs/porting/01_topology_analysis.md`, `docs/porting/02_terminology_map.md` |
 
 ### Phase 2 — Kernel Deep-Dive
@@ -124,9 +109,9 @@ For each phase: agent responsible, sub-agents invoked, and skills loaded.
 | Item | Detail |
 |------|--------|
 | **Agent** | `deepep-kernel-analyst` |
-| **Sub-agents** | `cuda-kernel-reader` (invoked once per kernel file) |
-| **Skills loaded by sub-agent** | `analyze-cuda-kernels`, `asm-translation-guide` |
-| **Reads** | all files in `csrc/kernels/` |
+| **Sub-agents** | none |
+| **Skills loaded** | `analyze-cuda-kernels`, `asm-translation-guide` |
+| **Reads** | all files in `csrc/kernels/` (analysis is per kernel, not per file) |
 | **Writes** | `docs/porting/03_kernel_analysis.md` |
 
 ### Phase 3 — SYCL Kernel Generation
@@ -135,21 +120,11 @@ For each phase: agent responsible, sub-agents invoked, and skills loaded.
 |------|--------|
 | **Agent** | `sycl-code-generator` |
 | **Sub-agents** | none |
-| **Skills loaded** | `sycl-translation-patterns`, `ishmem-migration-guide`, `asm-translation-guide` |
+| **Skills loaded** | `ishmem-migration-guide`, `asm-translation-guide` |
 | **Reads** | `docs/porting/01_topology_analysis.md`, `docs/porting/02_terminology_map.md`, `docs/porting/03_kernel_analysis.md`, `csrc/kernels/` |
-| **Writes** | `csrc_sycl/` (all kernel + runtime + layout files) |
+| **Writes** | `csrc_sycl/` (all kernel + runtime + layout files), `csrc/deep_ep.cpp`, `csrc/deep_ep.hpp`, `setup.py`, `CMakeLists.txt` |
 
-### Phase 4 — Python Binding Porting
-
-| Item | Detail |
-|------|--------|
-| **Agent** | `python-binding-porter` |
-| **Sub-agents** | none |
-| **Skills loaded** | `sycl-translation-patterns`, `intel-topology-background` |
-| **Reads** | `csrc/deep_ep.cpp`, `csrc/deep_ep.hpp`, `deep_ep/buffer.py`, `deep_ep/__init__.py`, `setup.py`, `csrc_sycl/` (generated) |
-| **Writes** | updated `csrc/deep_ep.cpp`, `csrc/deep_ep.hpp`, `setup.py`, `CMakeLists.txt` |
-
-### Phase 5 — Memory Model Verification
+### Phase 4 — Memory Model Verification
 
 | Item | Detail |
 |------|--------|
@@ -160,7 +135,7 @@ For each phase: agent responsible, sub-agents invoked, and skills loaded.
 | **Writes** | `docs/porting/04_memory_verification.md` + in-place code corrections in `csrc_sycl/` |
 | **Human-in-loop** | STOP on any HIGH RISK item — do not proceed until human confirms |
 
-### Phase 6 — Report Generation
+### Phase 5 — Report Generation
 
 | Item | Detail |
 |------|--------|
@@ -172,36 +147,25 @@ For each phase: agent responsible, sub-agents invoked, and skills loaded.
 
 ---
 
-## Agent Inventory (6 total)
-
-### Primary Agents (user-invocable, 5)
+## Agent Inventory (5 total)
 
 | Agent file | Phase | Responsibility | Primary output |
 |-----------|-------|---------------|----------------|
 | `deepep-topology-analyst.agent.md` | Phase 1 | Load topology backgrounds, resolve VERIFY items, build terminology map | `01_topology_analysis.md`, `02_terminology_map.md` |
-| `deepep-kernel-analyst.agent.md` | Phase 2 | Dispatch cuda-kernel-reader per file, aggregate analysis | `03_kernel_analysis.md` |
-| `sycl-code-generator.agent.md` | Phase 3 | Generate SYCL + Level Zero + ishmem kernel code | `csrc_sycl/` |
-| `python-binding-porter.agent.md` | Phase 4 | Port pybind11 bindings, C++ API, setup.py for SYCL stack | updated `csrc/`, `setup.py` |
-| `memory-model-verifier.agent.md` | Phase 5 | Verify memory ordering & coherence correctness | `04_memory_verification.md` + corrections |
-| `porting-report-generator.agent.md` | Phase 6 | Aggregate and generate final porting report | `PORTING_REPORT.md` |
-
-### Sub-Agents (invoked by primary agents only, 1)
-
-| Agent file | Invoked by | Phase | Skills loaded |
-|-----------|-----------|-------|---------------|
-| `cuda-kernel-reader.agent.md` | kernel-analyst | Phase 2 | `analyze-cuda-kernels`, `asm-translation-guide` |
+| `deepep-kernel-analyst.agent.md` | Phase 2 | Per-kernel analysis of all CUDA kernel implementations | `03_kernel_analysis.md` |
+| `sycl-code-generator.agent.md` | Phase 3 | Generate SYCL + Level Zero + ishmem code; port binding layer | `csrc_sycl/`, updated `csrc/`, `setup.py` |
+| `memory-model-verifier.agent.md` | Phase 4 | Verify memory ordering & coherence correctness | `04_memory_verification.md` + corrections |
+| `porting-report-generator.agent.md` | Phase 5 | Aggregate and generate final porting report | `PORTING_REPORT.md` |
 
 ---
 
-## Skills Inventory (7 total)
+## Skills Inventory (5 total)
 
 | Skill directory | Loaded by | Phase | Purpose |
 |----------------|-----------|-------|---------|
-| `nvidia-topology-background/` | deepep-topology-analyst | 1 | NVIDIA H100 hardware spec + intranode/internode topology — static prior knowledge |
 | `intel-topology-background/` | deepep-topology-analyst | 1 | Intel B60/B70 hardware spec + known PCIe/ishmem topology — static prior knowledge |
-| `analyze-cuda-kernels/` | cuda-kernel-reader | 2 | Methodology for systematic CUDA kernel analysis |
-| `asm-translation-guide/` | cuda-kernel-reader, sycl-code-generator | 2, 3 | PTX inline assembly → Intel GPU equivalent patterns (tvisa reference) |
-| `sycl-translation-patterns/` | sycl-code-generator, python-binding-porter | 3, 4 | CUDA→SYCL translation patterns + API mapping table |
+| `analyze-cuda-kernels/` | deepep-kernel-analyst | 2 | Methodology for systematic CUDA kernel analysis |
+| `asm-translation-guide/` | deepep-kernel-analyst, sycl-code-generator | 2, 3 | PTX inline assembly → Intel GPU equivalent patterns (tvisa reference) |
 | `ishmem-migration-guide/` | sycl-code-generator | 3 | NVSHMEM→ishmem migration reference |
 | `memory-model-verification/` | memory-model-verifier | 5 | SYCL/ishmem memory ordering verification checklist |
 
@@ -231,11 +195,12 @@ csrc_sycl/                          ← Phase 3 output
 ├── internode_ll.cpp            ← low-latency internode variant
 └── ibgda_device.hpp            ← NIC device-side operations
 
-csrc/                               ← Phase 4 updates (Python binding)
+csrc_sycl/                          ← Phase 3 output (kernels)
+csrc/                               ← Phase 3 output (binding layer)
 ├── deep_ep.cpp                 ← pybind11 bindings (CUDA → SYCL queue/device)
 ├── deep_ep.hpp                 ← C++ API (CUDA IPC → Level Zero IPC)
 └── CMakeLists.txt              ← icpx compiler, SYCL flags
-setup.py                            ← Phase 4 update (icpx build)
+setup.py                            ← Phase 3 update (icpx build)
 ```
 
 ---
@@ -284,18 +249,13 @@ All generated SYCL code must use these standard comment markers:
 │   ├── deepep-topology-analyst.agent.md
 │   ├── deepep-kernel-analyst.agent.md
 │   ├── sycl-code-generator.agent.md
-│   ├── python-binding-porter.agent.md
 │   ├── memory-model-verifier.agent.md
 │   ├── porting-report-generator.agent.md
-│   └── cuda-kernel-reader.agent.md       ← sub-agent
+│   └── cuda-kernel-reader.agent.md       ← retained for optional per-kernel deep-dive
 └── skills/
-    ├── nvidia-topology-background/SKILL.md
     ├── intel-topology-background/SKILL.md
     ├── analyze-cuda-kernels/SKILL.md
     ├── asm-translation-guide/SKILL.md
-    ├── sycl-translation-patterns/
-    │   ├── SKILL.md
-    │   └── references/cuda-sycl-mapping.md
     ├── ishmem-migration-guide/
     │   ├── SKILL.md
     │   └── references/nvshmem-ishmem-api-map.md
@@ -321,8 +281,8 @@ Select the corresponding agent in the Agent picker, for example:
 - Re-run Phase 1: select `deepep-topology-analyst`
 - Re-run Phase 2: select `deepep-kernel-analyst`
 - Re-run Phase 3: select `sycl-code-generator`
-- Re-run Phase 4: select `python-binding-porter`
-- Re-run Phase 5: select `memory-model-verifier`
+- Re-run Phase 4: select `memory-model-verifier`
+- Re-run Phase 5: select `porting-report-generator`
 
 ### Review current risk items
 

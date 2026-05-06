@@ -16,13 +16,12 @@ topology, then produce a comprehensive mapping between them.
 
 ## Approach
 
-### Step 1 — Load NVIDIA Hardware Topology Background
+### Step 1 — Apply Built-in NVIDIA H100 Topology Knowledge
 
-Load the `nvidia-topology-background` skill. This skill contains the pre-documented
-NVIDIA H100 SXM hardware topology background that serves as prior knowledge for this
-porting project. You do NOT need to discover these facts dynamically — they are fixed:
+Use your built-in knowledge of NVIDIA H100 SXM hardware topology — no skill load needed.
+The key facts are well-documented public knowledge:
 
-**Key background facts the skill provides**:
+**Key background facts to apply**:
 - H100 SXM intranode physical topology: NVSwitch fabric, NVLink 4.0 bandwidth (~900 GB/s
   aggregate), cache-coherent GPU-to-GPU transfers that never touch PCIe or CPU
 - Internode physical topology: MLX HCA connects to GPU via PCIe, GPUDirect RDMA mechanism,
@@ -31,8 +30,7 @@ porting project. You do NOT need to discover these facts dynamically — they ar
 - Key hardware assumptions baked into DeepEP code: NVLink coherence (no explicit flush
   needed after GPU writes to peer), `__threadfence_system()` before NIC doorbell, etc.
 
-After loading the skill, additionally read the DeepEP source to confirm the key code-level
-hardware assumptions:
+Additionally read the DeepEP source to confirm the key code-level hardware assumptions:
 - `csrc/kernels/intranode.cu`: does it rely on coherent NVLink remote writes?
 - `csrc/kernels/ibgda_device.cuh`: how does GPU post directly to NIC QP/doorbell?
 - `csrc/kernels/configs.cuh`: what hardware bandwidth numbers are encoded in constants?

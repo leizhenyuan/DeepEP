@@ -181,9 +181,12 @@ this is the producer side of a producer-consumer pair and requires `system` scop
 
 > 🔴 **KNOWN HARDWARE LIMITATION on Intel B60 (Xe2/BMG)**: `sycl::atomic_ref` with
 > `memory_scope::system` acquire/release semantics does NOT reliably provide PCIe-level
-> ordering between producer and consumer GPUs. Use **`atomic_fence(seq_cst, system)`**
-> as the explicit ordering primitive instead. `atomic_ref<system>` may only be used for
-> pure local-GPU atomics (e.g., intra-GPU counters) where cross-PCIe visibility is not required.
+> ordering for **cross-PCIe producer-consumer synchronization** (GPU↔peer GPU or GPU↔NIC).
+> Use **`atomic_fence(seq_cst, system)`** as the explicit ordering primitive instead.
+>
+> This limitation is **scoped to PCIe-connected peers with `memory_scope::system`**.
+> `atomic_ref` with `memory_scope::device` for intra-GPU atomics (e.g., local counters,
+> intra-work-group flags) is unaffected and remains correct.
 
 | # | Check | Method | Status |
 |---|-------|--------|--------|

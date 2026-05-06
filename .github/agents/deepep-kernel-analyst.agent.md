@@ -24,17 +24,31 @@ Read `csrc/kernels/configs.cuh` and `csrc/config.hpp` directly to extract:
 - Warp size assumptions
 - Any compile-time configuration flags affecting kernel behavior
 
-### Step 2 — Dispatch Sub-Agent Per Kernel File
+### Step 2 — Enumerate Kernels and Dispatch Sub-Agent Per Significant Kernel
 
-Invoke the `cuda-kernel-reader` sub-agent once per file, in this order:
+First, read all kernel files to identify every `__global__` kernel function:
+- `csrc/kernels/intranode.cu`
+- `csrc/kernels/internode.cu`
+- `csrc/kernels/internode_ll.cu`
+- `csrc/kernels/ibgda_device.cuh`
+- `csrc/kernels/runtime.cu`
+- `csrc/kernels/layout.cu`
 
-1. `csrc/kernels/runtime.cu` — runtime infrastructure and initialization
-2. `csrc/kernels/layout.cu` — buffer allocation and memory layout management
-3. `csrc/kernels/intranode.cu` — intranode (NVLink/IPC) communication kernels
-4. `csrc/kernels/internode.cu` — internode (NVSHMEM/RDMA) communication kernels
-5. `csrc/kernels/internode_ll.cu` — low-latency internode variant
-6. `csrc/kernels/ibgda_device.cuh` — IBGDA NIC device-side operations
-7. Headers: `api.cuh`, `buffer.cuh`, `launch.cuh`, `utils.cuh`
+For each kernel function found, apply the **trivial kernel rule** yourself first:
+- If it is fewer than ~30 lines AND has no synchronization, no NVSHMEM/IPC calls, and no PTX,
+  record it as `"<kernel_name>: trivial utility kernel, skipped"` and move on.
+
+For every **non-trivial** kernel, invoke the `cuda-kernel-reader` sub-agent once,
+passing the kernel function name and source file as the argument:
+```
+<kernel_name> in <source_file_path>
+```
+
+Priority order (most important first):
+1. `intranode.cu` kernels — dispatch/combine main paths
+2. `internode.cu` / `internode_ll.cu` kernels — NVSHMEM/IBGDA paths
+3. `ibgda_device.cuh` device functions
+4. `runtime.cu`, `layout.cu` — initialization and layout helpers
 
 For each file, pass the file path as the argument to the sub-agent.
 
