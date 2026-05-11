@@ -1,118 +1,96 @@
 ---
-description: "Start the DeepEP Intel GPU porting workflow. Orchestrates all 6 phases sequentially: topology analysis, kernel analysis, SYCL code generation, memory model verification, performance tuning, and final report generation. Use when beginning a full porting run or resuming from a specific phase."
-argument-hint: "Optional phase number to start from: 1=topology, 2=kernels, 3=codegen, 4=memory, 5=perf, 6=report"
+description: "Start the DeepEP Intel GPU porting workflow (internode path only). Orchestrates 4 phases: topology analysis, kernel deep-dive, per-kernel SYCL generation with inline memory verification, and final report. Use when beginning a full run or resuming from a specific phase."
+argument-hint: "Optional phase to start from: 1=topology, 2=kernels, 3a=infra, 3b=kernel, 4=report"
 ---
 
 # DeepEP Intel B60/B70 Porting Workflow
 
-You are the orchestrator for porting DeepEP from NVIDIA GPU (CUDA/NVSHMEM) to Intel B60/B70 (Battlemage/BMG) GPU using SYCL + Level Zero + ishmem.
+You are the orchestrator for porting DeepEP internode kernels from NVIDIA GPU (CUDA/NVSHMEM)
+to Intel B60/B70 (Battlemage/BMG) using SYCL + ishmem.
 
-Execute the phases listed below **in order**. Each phase produces output files that the next phase reads.
-If `$ARGUMENT` is provided as a phase number, skip directly to that phase.
+**Scope**: internode path only — `internode.cu`, `internode_ll.cu`, `ibgda_device.cuh`.
+Intranode (`intranode.cu`) is out of scope.
+
+Execute phases in order. Each phase produces files the next phase reads.
+Skip to `$ARGUMENT` phase if provided.
 
 ## Pre-Flight Check
 
-Before starting, verify:
-1. `csrc/` directory exists with original CUDA source
-2. `docs/porting/` directory will be created if absent
-3. `csrc_sycl/` directory will be created if absent
+1. `csrc/` exists with original CUDA source
+2. `docs/porting/` will be created if absent
+3. `csrc_sycl/` will be created if absent
 
-## Phase Execution
+---
 
-### Phase 1 — Topology Analysis & Terminology Mapping
+## Phase 1 — Internode Topology Analysis
 **Agent**: `deepep-topology-analyst`
 
-This agent uses sub-agents to:
-- Analyze how DeepEP uses NVIDIA topology (NVLink, NVSHMEM, IBGDA, CUDA IPC)
-- Research Intel B60/B70 (Battlemage) hardware topology and ishmem capabilities
-- Build a complete NVIDIA → Intel terminology and API mapping
+- Analyzes NVSHMEM/IBGDA patterns in DeepEP internode code
+- Researches Intel B60/B70 ishmem + CX6 capabilities
+  - Fetches https://github.com/oneapi-src/ishmem for API semantics
+  - Fetches https://github.com/intel-sandbox/ishmem_ibgda for GPU-direct NIC posting (IBGDA equivalent)
+  - Searches PCIe relaxed ordering + Intel GPU coherence behavior
+- Documents gaps between NVIDIA and Intel internode paths
+- **ANY uncertainty about PCIe behavior, ishmem semantics, or IBGDA equivalence → STOP and report to user before continuing**
 
-**Expected outputs**:
-- `docs/porting/01_topology_analysis.md`
-- `docs/porting/02_terminology_map.md`
+**Output**: `docs/porting/01_topology_analysis.md`
 
-**Checkpoint**: After Phase 1 completes, present any HIGH RISK findings to the user before continuing.
+**Checkpoint**: Present HIGH RISK findings before continuing.
 
 ---
 
-### Phase 2 — CUDA Kernel Deep-Dive Analysis
+## Phase 2 — Kernel Deep-Dive (4 kernels)
 **Agent**: `deepep-kernel-analyst`
 
-This agent dispatches the `cuda-kernel-reader` sub-agent for each kernel file:
-- `csrc/kernels/runtime.cu`
-- `csrc/kernels/layout.cu`
-- `csrc/kernels/intranode.cu`
-- `csrc/kernels/internode.cu`
-- `csrc/kernels/internode_ll.cu`
-- `csrc/kernels/ibgda_device.cuh`
-- Supporting headers: `api.cuh`, `configs.cuh`, `utils.cuh`
+Analyzes the 4 target kernels via `cuda-kernel-reader` sub-agent:
+- dispatch + combine in `internode.cu`
+- dispatch + combine in `internode_ll.cu`
 
-**Expected output**:
-- `docs/porting/03_kernel_analysis.md`
+**Outputs**: `docs/porting/kernels/internode_dispatch.md`, `internode_combine.md`,
+`internode_ll_dispatch.md`, `internode_ll_combine.md`
 
-**Checkpoint**: After Phase 2 completes, present HIGH RISK items to the user before continuing.
+**Checkpoint**: Present HIGH RISK items before continuing.
 
 ---
 
-### Phase 3 — SYCL Code Generation
-**Agent**: `sycl-code-generator`
+## Phase 3a — Shared Infrastructure (once)
+**Agent**: `sycl-infra-generator`
 
-This agent reads Phase 1 and Phase 2 outputs, then generates:
-- Complete SYCL + Level Zero + ishmem implementation in `csrc_sycl/`
-- Uses `ishmem-migration-guide` and `asm-translation-guide` skills
+Generates shared layer: configs, utils, buffer, runtime, CMakeLists, setup.py.
 
-**Expected outputs**:
-- `csrc_sycl/` (complete SYCL codebase)
-- `docs/porting/03b_generation_notes.md` (decisions and open questions)
+**Outputs**: `csrc_sycl/configs.hpp`, `utils.hpp`, `buffer.hpp`, `runtime.cpp`, `CMakeLists.txt`
 
-**Checkpoint**: After Phase 3, pause and let the user review HIGH_RISK annotations in generated code.
+**Checkpoint**: Review HIGH_RISK annotations before Phase 3b.
 
 ---
 
-### Phase 4 — Memory Model Verification
-**Agent**: `memory-model-verifier`
+## Phase 3b — Per-Kernel Generation (repeat ×4)
+**Agent**: `sycl-kernel-generator`
 
-This agent audits all generated SYCL/ishmem code for memory ordering and coherence correctness.
+Invoke once per kernel. Each invocation generates SYCL code + Python test + inline
+memory model verification. **Human checkpoint after each kernel.**
 
-> **CRITICAL**: Any unresolved memory ordering issue is a BLOCKER. The agent MUST stop and
-> report to the user rather than guessing at a fix.
+| Order | Argument | Output |
+|-------|----------|--------|
+| 1 | `internode_dispatch` | `csrc_sycl/internode_dispatch.cpp` + `tests/test_internode_dispatch_sycl.py` |
+| 2 | `internode_combine` | `csrc_sycl/internode_combine.cpp` + `tests/test_internode_combine_sycl.py` |
+| 3 | `internode_ll_dispatch` | `csrc_sycl/internode_ll_dispatch.cpp` + `tests/test_internode_ll_dispatch_sycl.py` |
+| 4 | `internode_ll_combine` | `csrc_sycl/internode_ll_combine.cpp` + `tests/test_internode_ll_combine_sycl.py` |
 
-**Expected outputs**:
-- `docs/porting/04_memory_verification.md`
-- Corrected code in `csrc_sycl/` (with `// MEMORY_MODEL_FIX:` annotations)
-
-**Checkpoint**: Present ALL memory model issues to user, regardless of risk level.
-
----
-
-### Phase 5 — Performance Tuning
-**Agent**: `bmg-performance-tuner`
-
-This agent optimizes the verified SYCL code for Intel B60/B70 (BMG) hardware.
-
-> **NOTE**: Performance tuning parameters (work-group size, SLM layout, etc.) need validation
-> on actual hardware. The agent will document requirements and leave final numbers for human validation.
-
-**Expected outputs**:
-- `docs/porting/05_performance_report.md`
-- Optimized code in `csrc_sycl/` (with `// PERF_OPT:` annotations)
+> After each kernel: review HIGH_RISK output summary → confirm → invoke next.
 
 ---
 
-### Phase 6 — Final Porting Report
+## Phase 4 — Final Report
 **Agent**: `porting-report-generator`
 
-This agent aggregates all analysis documents and code annotations into the final report.
-
-**Expected output**:
-- `docs/porting/PORTING_REPORT.md`
+**Output**: `docs/porting/PORTING_REPORT.md`
 
 ---
 
-## Important Rules
+## Rules
 
-1. **Never skip a phase** — each phase feeds the next.
-2. **HIGH RISK items always surface to the user** — agents must not silently proceed.
-3. **Memory ordering issues are blockers** — Phase 4 must complete before Phase 5.
-4. **All generated code must include** `// PORTED_FROM:` header comments.
-5. **Context is passed via files** — agents write to `docs/porting/` and read from there.
+1. HIGH RISK items always surface to the user — never silently proceed.
+2. Memory ordering issues found in Phase 3b are blockers — fix before next kernel.
+3. All generated SYCL code must have `// PORTED_FROM:` headers.
+4. Context passes via files in `docs/porting/` and `csrc_sycl/`.

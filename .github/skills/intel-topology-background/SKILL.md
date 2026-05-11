@@ -53,7 +53,7 @@ Multi-Node:
 | No NVLink | GPU↔GPU intranode is PCIe P2P only — NOT cache-coherent |
 | PCIe P2P coherence gap | After GPU0 writes to GPU1 IPC memory, GPU1 may need explicit cache invalidation |
 | CX6 on same PCIe switch | GPUDirect RDMA is physically possible (NIC shares PCIe switch with GPUs) |
-| PCIe relaxed ordering | Assume RO=1 — posted writes may arrive out of order across PCIe |
+| PCIe relaxed ordering | Assume RO=1 — posted writes may arrive out of order across PCIe ⚠️ VERIFY exact behavior; if uncertain STOP and report |
 | No NVSwitch | No full-mesh GPU fabric; GPU↔GPU bandwidth limited by PCIe switch throughput |
 
 ---
@@ -138,14 +138,19 @@ ishmem (Intel OpenSHMEM) provides a symmetric heap abstraction over GPU RDMA, an
 
 > All ishmem API mappings marked ⚠️ VERIFY until confirmed against ishmem docs:
 > https://github.com/oneapi-src/ishmem
+>
+> Additional reference for GPU-direct NIC ops (IBGDA-style) on Intel:
+> https://github.com/intel-sandbox/ishmem_ibgda
+> Check this repo for GPU-kernel-callable NIC posting, fence ordering, and doorbell-ring equivalents.
 
 ### IBGDA Equivalent on Intel+CX6
 
 | Question | Status |
-|----------|--------|
-| Does ishmem support GPU-kernel-initiated NIC operations (no CPU round-trip)? | ⚠️ VERIFY |
+|----------|---------|
+| Does ishmem support GPU-kernel-initiated NIC operations (no CPU round-trip)? | ⚠️ VERIFY via ishmem_ibgda repo |
 | Does CX6 + Intel GPU support GPUDirect RDMA (intel-peermem module)? | ⚠️ VERIFY |
-| Is there a doorbell-ring equivalent in ishmem for Intel GPU? | ⚠️ VERIFY via tvisa / ishmem source |
+| Is there a doorbell-ring equivalent in ishmem for Intel GPU? | ⚠️ VERIFY via tvisa / ishmem_ibgda source |
+| PCIe relaxed ordering — does GPU write visibility to NIC require explicit fence? | ⚠️ VERIFY — if unconfirmed, STOP and report to human |
 
 ### Memory Ordering for Internode (GPU → NIC → Remote GPU)
 

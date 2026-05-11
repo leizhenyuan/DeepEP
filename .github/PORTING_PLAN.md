@@ -6,15 +6,22 @@ Complete port of DeepEP (MoE All-to-All communication operator library) from NVI
 to Intel B60/B70 (Battlemage/BMG) GPU using the SYCL + Level Zero + ishmem stack.
 No CUDA code is retained in the final implementation.
 
-## Target Platform
+## Target Platform and Scope
 
 | Component | NVIDIA (Original) | Intel (Target) |
 |-----------|------------------|----------------|
 | GPU | H100/A100 | Intel B60/B70 (Battlemage) |
-| Intranode comm | NVLink / CUDA IPC | PCIe + Level Zero IPC handles |
-| Internode comm | NVSHMEM + IBGDA + MLX NIC | ishmem + MLX NIC (GPU-initiated) |
-| Programming model | CUDA | SYCL (high-level) + Level Zero (low-level) + visa (asm) |
-| Code strategy | — | Complete SYCL rewrite — no CUDA retained, only functional at first step |
+| Internode comm | NVSHMEM + IBGDA + MLX NIC | ishmem + MLX CX6 NIC (GPU-initiated) |
+| Programming model | CUDA | SYCL + ishmem + tvisa (asm) |
+| Code strategy | — | Per-kernel SYCL rewrite with inline memory verification |
+
+**V1 scope**: **internode path only** — intranode (`intranode.cu`, Level Zero IPC) is out of scope.
+
+**Target kernels** (4 total):
+1. `internode.cu` → dispatch kernel
+2. `internode.cu` → combine kernel
+3. `internode_ll.cu` → dispatch kernel (low-latency)
+4. `internode_ll.cu` → combine kernel (low-latency)
 
 ---
 
@@ -92,115 +99,123 @@ Phase 5: Report Generation
 
 ## Workflow Detail
 
-For each phase: agent responsible, sub-agents invoked, and skills loaded.
-
-### Phase 1 — Topology Analysis
+### Phase 1 — Topology Analysis (internode focus)
 
 | Item | Detail |
 |------|--------|
 | **Agent** | `deepep-topology-analyst` |
-| **Sub-agents** | none |
 | **Skills loaded** | `intel-topology-background` |
-| **Additional tools** | web search to resolve ⚠️ VERIFY items in intel-topology-background |
+| **Additional tools** | web search for VERIFY items (ishmem semantics, CX6+Intel GPU, BMG sub-group size, PCIe ordering) |
+| **Key research targets** | `https://github.com/oneapi-src/ishmem` (API semantics), `https://github.com/intel-sandbox/ishmem_ibgda` (GPU-direct NIC ops), PCIe relaxed ordering + Intel GPU coherence |
+| **Uncertainty policy** | ANY unresolved PCIe behavior or ishmem/IBGDA equivalence → **STOP and report to human before continuing** |
+| **Reads** | `csrc/kernels/ibgda_device.cuh`, `csrc/kernels/internode.cu`, `csrc/kernels/configs.cuh` |
 | **Writes** | `docs/porting/01_topology_analysis.md`, `docs/porting/02_terminology_map.md` |
 
-### Phase 2 — Kernel Deep-Dive
+### Phase 2 — Kernel Deep-Dive (internode kernels only)
 
 | Item | Detail |
 |------|--------|
 | **Agent** | `deepep-kernel-analyst` |
-| **Sub-agents** | none |
-| **Skills loaded** | `analyze-cuda-kernels`, `asm-translation-guide` |
-| **Reads** | all files in `csrc/kernels/` (analysis is per kernel, not per file) |
-| **Writes** | `docs/porting/03_kernel_analysis.md` |
+| **Sub-agent** | `cuda-kernel-reader` (once per kernel) |
+| **Skills** | `asm-translation-guide` |
+| **Target kernels** | dispatch + combine in `internode.cu`; dispatch + combine in `internode_ll.cu`; device functions in `ibgda_device.cuh` |
+| **Writes** | `docs/porting/kernels/<kernel_name>.md` (one file per kernel) |
 
-### Phase 3 — SYCL Kernel Generation
-
-| Item | Detail |
-|------|--------|
-| **Agent** | `sycl-code-generator` |
-| **Sub-agents** | none |
-| **Skills loaded** | `ishmem-migration-guide`, `asm-translation-guide` |
-| **Reads** | `docs/porting/01_topology_analysis.md`, `docs/porting/02_terminology_map.md`, `docs/porting/03_kernel_analysis.md`, `csrc/kernels/` |
-| **Writes** | `csrc_sycl/` (all kernel + runtime + layout files), `csrc/deep_ep.cpp`, `csrc/deep_ep.hpp`, `setup.py`, `CMakeLists.txt` |
-
-### Phase 4 — Memory Model Verification
+### Phase 3a — Shared Infrastructure (once)
 
 | Item | Detail |
 |------|--------|
-| **Agent** | `memory-model-verifier` |
-| **Sub-agents** | none |
-| **Skills loaded** | `memory-model-verification` |
-| **Reads** | all files in `csrc_sycl/`, `docs/porting/03_kernel_analysis.md` |
-| **Writes** | `docs/porting/04_memory_verification.md` + in-place code corrections in `csrc_sycl/` |
-| **Human-in-loop** | STOP on any HIGH RISK item — do not proceed until human confirms |
+| **Agent** | `sycl-infra-generator` |
+| **Skills loaded** | `intel-topology-background`, `ishmem-migration-guide` |
+| **Reads** | `docs/porting/01_topology_analysis.md`, `docs/porting/02_terminology_map.md`, `csrc/kernels/configs.cuh` |
+| **Writes** | `csrc_sycl/configs.hpp`, `csrc_sycl/utils.hpp`, `csrc_sycl/buffer.hpp`, `csrc_sycl/runtime.cpp`, `csrc_sycl/CMakeLists.txt`, updated `setup.py` |
 
-### Phase 5 — Report Generation
+### Phase 3b — Per-Kernel Generation + Inline Verification (repeat ×4)
+
+Invoke `sycl-kernel-generator` once per kernel. After each invocation, **human checkpoint**
+before proceeding to the next kernel.
+
+| Invocation | Argument | Source | Output |
+|-----------|----------|--------|--------|
+| 1 | `internode_dispatch` | `internode.cu` dispatch | `csrc_sycl/internode_dispatch.cpp` + `tests/test_internode_dispatch_sycl.py` |
+| 2 | `internode_combine` | `internode.cu` combine | `csrc_sycl/internode_combine.cpp` + `tests/test_internode_combine_sycl.py` |
+| 3 | `internode_ll_dispatch` | `internode_ll.cu` dispatch | `csrc_sycl/internode_ll_dispatch.cpp` + `tests/test_internode_ll_dispatch_sycl.py` |
+| 4 | `internode_ll_combine` | `internode_ll.cu` combine | `csrc_sycl/internode_ll_combine.cpp` + `tests/test_internode_ll_combine_sycl.py` |
+
+Each invocation also performs **inline memory model verification** (Sections 0.2, 3, 5, 6 of
+the checklist) and stops for human review if any 🔴 HIGH RISK item is found.
+
+### Phase 4 — Report
 
 | Item | Detail |
 |------|--------|
 | **Agent** | `porting-report-generator` |
-| **Sub-agents** | none |
-| **Skills loaded** | none |
-| **Reads** | all `docs/porting/*.md`, `csrc_sycl/` |
+| **Reads** | all `docs/porting/*.md`, all `csrc_sycl/` files |
 | **Writes** | `docs/porting/PORTING_REPORT.md` |
 
 ---
 
-## Agent Inventory (5 total)
+## Agent Inventory (6 total)
 
-| Agent file | Phase | Responsibility | Primary output |
-|-----------|-------|---------------|----------------|
-| `deepep-topology-analyst.agent.md` | Phase 1 | Load topology backgrounds, resolve VERIFY items, build terminology map | `01_topology_analysis.md`, `02_terminology_map.md` |
-| `deepep-kernel-analyst.agent.md` | Phase 2 | Per-kernel analysis of all CUDA kernel implementations | `03_kernel_analysis.md` |
-| `sycl-code-generator.agent.md` | Phase 3 | Generate SYCL + Level Zero + ishmem code; port binding layer | `csrc_sycl/`, updated `csrc/`, `setup.py` |
-| `memory-model-verifier.agent.md` | Phase 4 | Verify memory ordering & coherence correctness | `04_memory_verification.md` + corrections |
-| `porting-report-generator.agent.md` | Phase 5 | Aggregate and generate final porting report | `PORTING_REPORT.md` |
-
----
-
-## Skills Inventory (5 total)
-
-| Skill directory | Loaded by | Phase | Purpose |
-|----------------|-----------|-------|---------|
-| `intel-topology-background/` | deepep-topology-analyst | 1 | Intel B60/B70 hardware spec + known PCIe/ishmem topology — static prior knowledge |
-| `analyze-cuda-kernels/` | deepep-kernel-analyst | 2 | Methodology for systematic CUDA kernel analysis |
-| `asm-translation-guide/` | deepep-kernel-analyst, sycl-code-generator | 2, 3 | PTX inline assembly → Intel GPU equivalent patterns (tvisa reference) |
-| `ishmem-migration-guide/` | sycl-code-generator | 3 | NVSHMEM→ishmem migration reference |
-| `memory-model-verification/` | memory-model-verifier | 5 | SYCL/ishmem memory ordering verification checklist |
+| Agent | Phase | Invoked by | Responsibility |
+|-------|-------|-----------|----------------|
+| `deepep-topology-analyst` | 1 | user | Internode topology analysis, ishmem/CX6 VERIFY items |
+| `deepep-kernel-analyst` | 2 | user | Enumerate + dispatch per-kernel analysis |
+| `cuda-kernel-reader` | 2 | kernel-analyst | Deep analysis of one kernel → `docs/porting/kernels/<name>.md` |
+| `sycl-infra-generator` | 3a | user | Shared infra: configs, utils, runtime, CMakeLists |
+| `sycl-kernel-generator` | 3b | user (once per kernel) | One kernel: SYCL code + inline mem-model check + Python test |
+| `porting-report-generator` | 4 | user | Aggregate final report |
 
 ---
 
-## Context Passing Mechanism
+## Skills Inventory (4 total)
+
+| Skill | Loaded by | Phase | Purpose |
+|-------|-----------|-------|---------|
+| `intel-topology-background/` | deepep-topology-analyst, sycl-infra-generator | 1, 3a | Intel B60/B70 hardware spec + ishmem topology |
+| `asm-translation-guide/` | deepep-kernel-analyst, sycl-kernel-generator | 2, 3b | PTX → Intel GPU patterns (tvisa reference) |
+| `ishmem-migration-guide/` | sycl-infra-generator, sycl-kernel-generator | 3a, 3b | NVSHMEM→ishmem API mapping |
+| `memory-model-verification/` | sycl-kernel-generator | 3b | Inline memory ordering checklist (per-kernel) |
+
+---
+
+## Context Passing
 
 All inter-agent context is passed via the **file system**:
 
 ```
 docs/porting/
-├── 01_topology_analysis.md     ← Phase 1 output
-├── 02_terminology_map.md       ← Phase 1 output
-├── 03_kernel_analysis.md       ← Phase 2 output
-├── 04_memory_verification.md   ← Phase 5 output
-└── PORTING_REPORT.md           ← Phase 6 output (final report)
+├── 01_topology_analysis.md     ← Phase 1
+├── 02_terminology_map.md       ← Phase 1
+├── kernels/
+│   ├── internode_dispatch.md       ← Phase 2
+│   ├── internode_combine.md        ← Phase 2
+│   ├── internode_ll_dispatch.md    ← Phase 2
+│   └── internode_ll_combine.md     ← Phase 2
+└── PORTING_REPORT.md           ← Phase 4
 
-csrc_sycl/                          ← Phase 3 output
+csrc_sycl/                          ← Phase 3a + 3b
 ├── CMakeLists.txt
 ├── configs.hpp
 ├── utils.hpp
-├── runtime.cpp
-├── layout.cpp
 ├── buffer.hpp
-├── intranode.cpp               ← IPC/PCIe intranode communication
-├── internode.cpp               ← ishmem internode communication
-├── internode_ll.cpp            ← low-latency internode variant
-└── ibgda_device.hpp            ← NIC device-side operations
+├── runtime.cpp
+├── internode_dispatch.cpp
+├── internode_combine.cpp
+├── internode_ll_dispatch.cpp
+└── internode_ll_combine.cpp
 
-csrc_sycl/                          ← Phase 3 output (kernels)
-csrc/                               ← Phase 3 output (binding layer)
-├── deep_ep.cpp                 ← pybind11 bindings (CUDA → SYCL queue/device)
-├── deep_ep.hpp                 ← C++ API (CUDA IPC → Level Zero IPC)
-└── CMakeLists.txt              ← icpx compiler, SYCL flags
-setup.py                            ← Phase 3 update (icpx build)
+tests/                              ← Phase 3b (one test per kernel)
+├── test_internode_dispatch_sycl.py
+├── test_internode_combine_sycl.py
+├── test_internode_ll_dispatch_sycl.py
+└── test_internode_ll_combine_sycl.py
+
+csrc/                               ← Phase 3a (binding layer)
+├── deep_ep.cpp
+├── deep_ep.hpp
+└── CMakeLists.txt
+setup.py
 ```
 
 ---
@@ -268,24 +283,23 @@ All generated SYCL code must use these standard comment markers:
 
 ## Usage
 
-### Start the full workflow
+### Full workflow
 
-In VS Code Copilot Chat:
 ```
 /start-deepep-porting
 ```
 
-### Run a single phase
+### Single phase
 
-Select the corresponding agent in the Agent picker, for example:
-- Re-run Phase 1: select `deepep-topology-analyst`
-- Re-run Phase 2: select `deepep-kernel-analyst`
-- Re-run Phase 3: select `sycl-code-generator`
-- Re-run Phase 4: select `memory-model-verifier`
-- Re-run Phase 5: select `porting-report-generator`
+| Phase | Agent | Argument |
+|-------|-------|----------|
+| 1 | `deepep-topology-analyst` | — |
+| 2 | `deepep-kernel-analyst` | — |
+| 3a | `sycl-infra-generator` | — |
+| 3b kernel 1 | `sycl-kernel-generator` | `internode_dispatch` |
+| 3b kernel 2 | `sycl-kernel-generator` | `internode_combine` |
+| 3b kernel 3 | `sycl-kernel-generator` | `internode_ll_dispatch` |
+| 3b kernel 4 | `sycl-kernel-generator` | `internode_ll_combine` |
+| 4 | `porting-report-generator` | — |
 
-### Review current risk items
-
-After each phase completes, check the corresponding analysis document.
-All HIGH RISK items are aggregated in `PORTING_REPORT.md`.
-
+> After each Phase 3b invocation, review the HIGH_RISK summary before invoking the next kernel.

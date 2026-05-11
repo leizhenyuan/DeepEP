@@ -4,8 +4,8 @@
 
 This is the **DeepEP Intel GPU porting project**. DeepEP is a specialized MoE (Mixture of Experts)
 all-to-all communication operator library originally written for NVIDIA GPUs using CUDA/NVSHMEM.
-The goal is to **completely rewrite** it for Intel B60/B70 (Battlemage/BMG) GPUs using SYCL + Level Zero + ishmem.
-No CUDA code is retained in the final implementation.
+The goal is to **port** it to Intel B60/B70 (Battlemage/BMG) GPUs using SYCL + Level Zero + ishmem.
+The original CUDA source is **kept as a reference** for side-by-side comparison with the generated SYCL code.
 
 ## Target Platform Summary
 
@@ -37,28 +37,6 @@ Multi-Node:
 - **CX6 shares PCIe switch with GPUs**: enables GPUDirect RDMA (NIC DMA directly from GPU HBM)
   — same principle as NVIDIA, but via PCIe switch instead of NVSwitch
 
-## Key Terminology Mapping (Quick Reference)
-
-| CUDA/NVIDIA Concept | SYCL/Intel Equivalent | Notes |
-|--------------------|----------------------|-------|
-| Thread block | Work-group (`nd_item::get_group()`) | — |
-| Warp (32 threads) | Sub-group (`sycl::sub_group`) | BMG: 16 or 32 threads — VERIFY |
-| Shared memory | Local memory / SLM (`local_accessor`) | — |
-| `__global__` kernel | SYCL kernel (`parallel_for`) | — |
-| `threadIdx.x` | `item.get_local_id(0)` | — |
-| `blockIdx.x` | `item.get_group(0)` | — |
-| `__syncthreads()` | `sycl::group_barrier(g)` | — |
-| `__syncwarp()` | `sg.barrier()` | No mask support in SYCL! |
-| `__threadfence()` | `atomic_fence(seq_cst, device)` | VERIFY scope semantics |
-| `__threadfence_system()` | `atomic_fence(seq_cst, system)` | VERIFY covers NIC memory |
-| `cudaMalloc` | `sycl::malloc_device(queue)` | — |
-| CUDA IPC handle | `ze_ipc_mem_handle_t` (Level Zero) | Different lifecycle model |
-| NVSHMEM | ishmem | Intel's OpenSHMEM implementation |
-| `nvshmem_quiet()` | `ishmem_quiet()` | VERIFY ordering guarantee |
-| `nvshmem_fence()` | `ishmem_fence()` | VERIFY vs quiet semantics |
-| `nvshmem_barrier_all()` | `ishmem_barrier_all()` | Full collective |
-| IBGDA device-side NIC ops | ishmem NIC operations | ishmem abstracts NIC access |
-
 ## Output Directory Structure
 
 ```
@@ -71,8 +49,8 @@ csrc_sycl/               ← All generated SYCL source code
 **HIGH RISK → STOP immediately and ask the human:**
 - Memory ordering semantics uncertainty (fence/barrier behavioral differences)
 - ishmem API behavior uncertainty (especially quiet/fence/non-blocking operations)
-- BMG hardware characteristics uncertainty (sub-group size, SLM size, cache line size)
-- Level Zero IPC handle lifecycle uncertainty
+- Any CUDA→SYCL or NVSHMEM→ishmem equivalence that is not obviously correct
+- BMG sub-group size uncertainty (affects warp-level patterns in kernels)
 - NIC operation ordering uncertainty (GPU kernel directly operating NIC)
 
 **LOW RISK → Document and continue:**
@@ -87,7 +65,7 @@ All generated SYCL code must use these standard comment markers:
 // PORTED_FROM: csrc/kernels/<original_file>
 // HIGH_RISK: <description> — NEEDS HUMAN VERIFICATION
 // MEMORY_MODEL_FIX: <cuda_op> → <sycl_op> because <reason>
-// MEMORY_MODEL_ISSUE: <description> — UNRESOLVED, SEE docs/porting/04_memory_verification.md
+// MEMORY_MODEL_ISSUE: <description> — UNRESOLVED, requires human review
 // TODO: <item requiring human attention>
 ```
 
@@ -101,22 +79,22 @@ DeepEP CUDA kernels contain `asm volatile(...)` PTX blocks for:
 **Never silently drop or ignore inline assembly.** When porting:
 1. Load the `asm-translation-guide` skill
 2. Reference https://github.com/CaoZhongZ/tvisa for Intel GPU equivalents
-3. Use ESIMD (`sycl/ext/intel/esimd.hpp`) for operations requiring explicit cache control
-4. Mark any unresolved PTX as `// HIGH_RISK:` with the tvisa reference
+3. Mark any unresolved PTX as `// HIGH_RISK:` with the tvisa reference
 
 ## Source Structure Reference
 
 ```
-csrc/                    ← Original CUDA source (read-only reference)
+csrc/                    ← Original CUDA source (kept for comparison with generated SYCL code)
   deep_ep.cpp/.hpp       ← Top-level C++ API
   config.hpp             ← Global configuration
   kernels/
     configs.cuh          ← CUDA configuration constants
     api.cuh              ← Kernel API declarations
     buffer.cuh           ← Buffer management
-    intranode.cu         ← NVLink/IPC intranode kernels
-    internode.cu         ← NVSHMEM internode kernels
-    internode_ll.cu      ← Low-latency internode variant
+    internode.cu         ← NVSHMEM/IBGDA internode kernels (V1 target)
+    internode_ll.cu      ← low-latency internode variant (V1 target)
+    ibgda_device.cuh     ← NIC device-side operations (V1 target)
+    intranode.cu         ← NVLink/IPC intranode kernels (out of scope for V1)
     ibgda_device.cuh     ← IBGDA NIC device-side operations
     runtime.cu           ← Runtime initialization
     layout.cu            ← Memory layout management
