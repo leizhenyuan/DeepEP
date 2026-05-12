@@ -30,25 +30,36 @@ fetch and search tvisa for the corresponding Intel pattern.
 
 ## Common PTX Patterns in DeepEP and Their Intel Equivalents
 
+## Common PTX Patterns in DeepEP and Their Intel Equivalents
+
+> **Platform Capabilities:**
+> - `sycl::atomic_fence` is available and sufficient for all memory ordering
+> - `sycl::atomic_ref` is available for **non-system-scope** atomics (device/work_group/sub_group)
+> - For **system-scope** atomics: use `sycl::atomic_fence(seq_cst, system)` + compiler built-ins
+> - tvisa `lscFence` is NOT needed for fences — use `sycl::atomic_fence` instead
+
 ### 1. Memory Fence / Ordering
 
 ```cuda
-// CUDA PTX: system-scope fence (visible to NIC via PCIe)
-asm volatile("fence.sc.sys;" ::: "memory");
-// or
-asm volatile("membar.sys;" ::: "memory");
+// CUDA PTX: system-scope fence
+asm volatile("fence.acq_rel.sys;" ::: "memory");
 ```
 
 **Intel SYCL equivalent:**
 ```cpp
-sycl::atomic_fence(sycl::memory_order::seq_cst,
-                   sycl::memory_scope::system);
+sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
 ```
 
-**HIGH RISK**: `fence.sc.sys` in PTX guarantees visibility to all system agents including NIC.
-Whether `memory_scope::system` on BMG provides the same guarantee for CX6 DMA must be verified.
+**Full scope mapping:**
+| PTX Scope | SYCL Equivalent |
+|-----------|------------------|
+| `fence.acq_rel.sys` | `sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system)` |
+| `fence.acq_rel.gpu` | `sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::device)` |
+| `fence.acq_rel.cta` | `sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::work_group)` |
+| `fence.sc.sys` | `sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system)` |
 
-Check tvisa for: `lsc_fence`, `lsc_store`, memory scope patterns.
+**HIGH RISK**: Verify that `atomic_fence(system)` guarantees visibility to CX6 NIC
+for GPU-initiated RDMA. This is the PCIe equivalent of NVLink system fence.
 
 ---
 
@@ -57,74 +68,101 @@ Check tvisa for: `lsc_fence`, `lsc_store`, memory scope patterns.
 ```cuda
 // CUDA PTX: non-cacheable store to NIC MMIO space (doorbell ring)
 asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(doorbell_addr), "l"(value));
-// or via inline PTX with .cs (cache streaming) / .wt (write-through) qualifiers
-asm volatile("st.cs.global.u64 [%0], %1;" :: "l"(addr), "l"(val));
 ```
 
-**Intel equivalent** — use a `volatile` pointer write to prevent compiler reordering,
-preceded by a system-scope fence to ensure GPU store visibility to the NIC:
+**Intel equivalent** — use atomic_fence + volatile store:
 ```cpp
 // System-scope fence: ensure all prior stores are visible before doorbell
-sycl::atomic_fence(sycl::memory_order::seq_cst,
-                   sycl::memory_scope::system); // HIGH_RISK: verify CX6 visibility on BMG
+sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
 
 // Volatile store: prevents compiler from caching/reordering the write
 *(volatile uint64_t*)doorbell_ptr = value;
 ```
 
-**Note**: `volatile` prevents *compiler* reordering but does NOT guarantee hardware
-cache bypass on Intel GPU. For confirmed uncached semantics, use tvisa inline assembly:
-```cpp
-// Preferred: tvisa lsc_store pattern (no-cache, guaranteed MMIO-safe)
-// See https://github.com/CaoZhongZ/tvisa for the verified lsc_store<uncached> pattern
-```
-
-**Check tvisa for**: doorbell write patterns, MMIO access patterns, `lsc_store` with
-uncached or streaming semantics.
+**Note**: When using ishmem high-level API (confirmed approach), doorbell
+operations are handled internally by ishmem — no manual doorbell writes needed.
+This section applies only if raw NIC access is required.
 
 ---
 
 ### 3. Non-Temporal / Streaming Loads and Stores
 
 ```cuda
-// CUDA PTX: streaming load (L1 bypass, data not expected to be reused)
-asm volatile("ld.cs.global.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
+// CUDA PTX: streaming/non-allocating load (L1 bypass)
+asm volatile("ld.global.nc.L1::no_allocate.L2::256B.s32 %0, [%1];" : "=r"(val) : "l"(ptr));
 
-// CUDA PTX: non-temporal store (evict-first / streaming)
-asm volatile("st.cs.global.f32 [%0], %1;" :: "l"(ptr), "f"(val));
+// CUDA PTX: non-allocating store
+asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" :: "l"(ptr), "r"(val));
 ```
 
-**Intel equivalent** — SYCL has no portable streaming cache hint at the high-level API.
-Use plain loads/stores (correctness preserved, cache hint lost) or tvisa inline assembly:
+**Intel tvisa equivalent** — use `lscLoad`/`lscStore` with cache control:
 ```cpp
-// Plain fallback — no cache hint, functionally correct:
-float val = *ptr;          // streaming load fallback
-*ptr = val;                // non-temporal store fallback
+// Non-allocating load (L1 uncached, L3 cached):
+// Option A: tvisa lscLoad with CacheCtrl
+uint32_t val;
+lscLoad<32, CacheCtrl::L1UC_L3C>(&val, (void*)ptr);
 
-// Preferred: tvisa lsc_load / lsc_store with streaming hint (inline assembly)
-// See https://github.com/CaoZhongZ/tvisa for verified streaming patterns
+// Option B: simple volatile load (correctness preserved, cache hint lost):
+int val = *(volatile int*)ptr;
+
+// Non-allocating store:
+// Option A: tvisa lscStore with CacheCtrl
+lscStore<32, CacheCtrl::L1UC_L3WB>((void*)ptr, val);
+
+// Option B: simple volatile store (correctness preserved):
+*(volatile int*)ptr = val;
 ```
 
 **Note**: Dropping the cache hint affects performance only, not correctness.
+Prefer tvisa lscLoad/lscStore for hot paths where cache behavior matters.
 
 ---
 
 ### 4. Atomic Operations with Specific Scopes
 
+> **Platform Capabilities:**
+> - `sycl::atomic_ref` IS available for **non-system-scope** atomics (device, work_group, sub_group)
+> - For **system-scope** atomics: use `sycl::atomic_fence(system)` + compiler built-ins
+
 ```cuda
-// CUDA PTX: system-scope atomic (visible to CPU and NIC)
+// CUDA PTX: device-scope atomic
+asm volatile("atom.add.u32 %0, [%1], %2;"
+             : "=r"(old) : "l"(ptr), "r"(val));
+
+// CUDA PTX: system-scope atomic
 asm volatile("atom.sys.add.u32 %0, [%1], %2;"
              : "=r"(old) : "l"(ptr), "r"(val));
 ```
 
-**Intel SYCL equivalent:**
+**Intel equivalent — device/work_group scope (use `sycl::atomic_ref`):**
 ```cpp
+// Device-scope atomic add (replaces atomicAdd):
 sycl::atomic_ref<uint32_t,
     sycl::memory_order::relaxed,
-    sycl::memory_scope::system,          // system scope — covers CPU and NIC
+    sycl::memory_scope::device,
     sycl::access::address_space::global_space> ref(*ptr);
 uint32_t old = ref.fetch_add(val);
+
+// Device-scope atomic CAS (replaces atomicCAS):
+sycl::atomic_ref<int,
+    sycl::memory_order::acq_rel,
+    sycl::memory_scope::device,
+    sycl::access::address_space::global_space> ref(*ptr);
+int expected = cmp;
+ref.compare_exchange_strong(expected, val);
+// expected now holds old value
 ```
+
+**Intel equivalent — system-scope (replaces atomicAdd_system / atomicSub_system):**
+```cpp
+// System-scope atomic: bracket with atomic_fence(system)
+sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+uint32_t old = __atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST);
+sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+```
+
+**Note**: System-scope atomics are needed only for IPC-mapped memory (cross-GPU PCIe).
+For all GPU-local atomics, use `sycl::atomic_ref` with `device` scope.
 
 ---
 
@@ -154,16 +192,65 @@ uint32_t mask = sycl::reduce_over_group(sg,
 asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 ```
 
-**Intel equivalent** — use SYCL built-in prefetch (no cache-level control):
+**Intel tvisa equivalent:**
 ```cpp
-// SYCL prefetch (hints to hardware, cache level not specified)
-sycl::ext::oneapi::experimental::prefetch(ptr, sizeof(float) * 16);
+// tvisa lscPrefetch with cache control
+lscPrefetch<uint32_t, 16, 32, CacheCtrl::L1C_L3C>((void*)ptr);
 ```
 
-For L1-targeted prefetch, use tvisa inline assembly:
-```cpp
-// See https://github.com/CaoZhongZ/tvisa for lsc_prefetch with L1 cache hint
+---
+
+### 7. Named Barriers (CUDA barrier.sync N)
+
+```cuda
+// CUDA PTX: named barrier — synchronize a subset of threads in a CTA
+asm volatile("barrier.sync 0, %0;" :: "r"(count * 32));
+// barrier 0, waiting for `count` warps (count*32 threads)
+
+asm volatile("barrier.sync 1, %0;" :: "r"(count * 32));
+// barrier 1, different subset of warps
 ```
+
+**Intel tvisa equivalent — named barriers (nbarrier):**
+
+tvisa provides named barriers via `gateway.hpp`:
+```cpp
+#include "gen_visa_templates.hpp"  // includes gateway.hpp
+
+// Initialize N named barriers at kernel start (once per work-group)
+named_barrier_init<N>();  // N = number of distinct barriers needed
+
+// Signal barrier — each participating sub_group calls this
+nbarrier_signal(barrier_id, n_sub_groups);
+// barrier_id: 0..N-1
+// n_sub_groups: number of sub_groups participating in this barrier
+
+// Wait on barrier — blocks until all participants have signaled
+nbarrier_wait(barrier_id);
+```
+
+**Advanced: ProducerConsumer mode:**
+```cpp
+// For producer-consumer patterns (e.g., RDMA sender warps vs coordinator warp)
+BarrierPayload barrier(
+    barrier_id,
+    BarrierType::ProducerConsumer,
+    n_producers,   // number of producer sub_groups
+    n_consumers    // number of consumer sub_groups
+);
+nbarrier_signal(barrier);
+nbarrier_wait(barrier_id);
+```
+
+**DeepEP-specific mappings:**
+| CUDA Pattern | tvisa Equivalent |
+|---|---|
+| `barrier.sync 0, (kNumDispatchRDMASenderWarps+1)*32` | `nbarrier_signal(0, kNumDispatchRDMASenderWarps+1); nbarrier_wait(0);` |
+| `barrier.sync 1, (NUM_MAX_NVL_PEERS+1)*32` | `nbarrier_signal(1, NUM_MAX_NVL_PEERS+1); nbarrier_wait(1);` |
+| `__syncthreads()` | `sycl::group_barrier(item.get_group())` or `barrier()` (tvisa full barrier) |
+
+**Note**: tvisa `nbarrier_signal` takes the number of **sub_groups** (not threads),
+while CUDA `barrier.sync` takes the number of **threads**. Convert: `n_sub_groups = n_threads / 32`.
 
 ---
 
@@ -183,12 +270,15 @@ For every `asm volatile(...)` block, record:
 
 ### Step 2 — Classify Each ASM Block
 
-| Class | Description | Risk |
-|---|---|---|
-| **Performance hint only** | Prefetch, cache hint — correctness unaffected if dropped | LOW |
-| **Memory ordering** | Fence, membar — correctness depends on exact scope semantics | HIGH RISK |
-| **MMIO access** | Doorbell ring, NIC register write — must preserve non-cacheability | HIGH RISK |
-| **No SYCL equivalent** | Requires tvisa inline assembly pattern | MEDIUM/HARD |
+| Class | Description | Risk | Intel Approach |
+|---|---|---|---|
+| **Performance hint only** | Prefetch, cache hint — correctness unaffected if dropped | LOW | tvisa lscLoad/lscStore with CacheCtrl |
+| **Memory ordering** | Fence, membar — correctness depends on exact scope semantics | HIGH RISK | `sycl::atomic_fence` with matching scope |
+| **MMIO access** | Doorbell ring, NIC register write — must preserve non-cacheability | HIGH RISK | ishmem handles internally (no manual MMIO) |
+| **Named barrier** | Subset warp synchronization within CTA | MEDIUM | tvisa nbarrier_signal/nbarrier_wait |
+| **Scoped atomic (non-system)** | atomicAdd/CAS with device or work_group scope | LOW | `sycl::atomic_ref` with matching scope |
+| **System-scope atomic** | atomicAdd_system / atomicSub_system on IPC memory | HIGH RISK | `atomic_fence(system)` + `__atomic_*` built-in |
+| **No SYCL equivalent** | Requires tvisa inline assembly pattern | MEDIUM/HARD | Search tvisa include/ |
 
 ### Step 3 — Search tvisa
 

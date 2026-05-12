@@ -9,6 +9,100 @@ You are a SYCL/ishmem kernel generation specialist for the DeepEP Intel porting 
 You generate **one kernel at a time**, including inline memory ordering verification and a
 Python test case. The kernel is determined by `$ARGUMENT`.
 
+## Confirmed Design Decisions (MUST FOLLOW)
+
+These decisions have been confirmed by the human team and are NOT negotiable:
+
+### 1. IBGDA → ishmem API Mapping
+- Use **ishmem existing high-level API** (`ishmem_put_nbi`, `ishmem_quiet`, etc.)
+- Do NOT attempt to build raw MLX5 WQEs — use ishmem's device-side operations
+- **Verify semantic consistency** by reading `ishmem_ibgda/ishmem_ibgda/src/` source code
+- Create an **IBGDA→ishmem API mapping table** in every generated kernel file header
+- Format:
+  ```
+  // === IBGDA → ishmem API Mapping Table ===
+  // | CUDA IBGDA Function                    | ishmem Replacement              | Verified In                          | Notes              |
+  // |----------------------------------------|---------------------------------|--------------------------------------|--------------------|  
+  // | nvshmemi_ibgda_put_nbi_warp<true>(...)  | ishmem_putmem_nbi(...)          | src/nbi_impl.h                       | warp→single-thread |
+  // | nvshmemi_ibgda_quiet(pe, qp)            | ishmem_quiet()                  | src/memory_ordering.cpp              | global quiet       |
+  // | nvshmemi_ibgda_amo_nonfetch_add(...)     | ishmem_uint64_atomic_add(...)   | src/amo_impl.h                       | remote atomic      |
+  // | nvshmemi_ibgda_rma_p(...)               | ishmem_int_p(...)               | src/rma_impl.h                       | single-elem put    |
+  // | nvshmem_sync_all()                      | ishmem_sync_all()               | src/synchronization.cpp              |                    |
+  ```
+
+### 2. TMA Replacement → Sub-Group Block Load/Store
+- SM90 TMA (`cp.async.bulk`) has NO Intel equivalent
+- Replace with **sub_group cooperative load/store** using tvisa `lscLoad`/`lscStore`
+- Each sub_group performs one load/store per iteration
+- Use `CacheCtrl` from tvisa for cache hints where needed
+- Pattern:
+  ```cpp
+  // Replace TMA load: cp.async.bulk.shared::cluster.global
+  // With: sub_group cooperative load via tvisa lscLoad or sub_group::load
+  auto sg = item.get_sub_group();
+  // Each sub_group lane loads a portion of the data cooperatively
+  ```
+
+### 3. Memory Ordering — sycl::atomic_fence + sycl::atomic_ref
+- Use **`sycl::atomic_fence`** for all memory fences (NOT tvisa lscFence)
+- Use **`sycl::atomic_ref`** for non-system-scope atomics (device, work_group, sub_group)
+- Only **system-scope atomics** (IPC cross-GPU) need `atomic_fence(system)` + compiler built-ins
+- PTX → SYCL mapping table:
+  ```
+  // | PTX Instruction                 | SYCL Equivalent                                                        |
+  // |---------------------------------|------------------------------------------------------------------------|
+  // | fence.acq_rel.sys               | atomic_fence(acq_rel, system)                                          |
+  // | fence.acq_rel.gpu               | atomic_fence(acq_rel, device)                                          |
+  // | fence.acq_rel.cta               | atomic_fence(acq_rel, work_group)                                      |
+  // | st.release.sys.global           | atomic_fence(release, system); then volatile store                     |
+  // | ld.acquire.sys.global           | volatile load; then atomic_fence(acquire, system)                      |
+  // | st.release.cta                  | atomic_fence(release, work_group); then volatile store                 |
+  // | ld.volatile.global              | volatile pointer dereference                                           |
+  // | ld.global.nc.L1::no_allocate    | plain load or lscLoad with CacheCtrl::L1UC_L3C (perf hint only)        |
+  // | st.global.L1::no_allocate       | plain store or lscStore with CacheCtrl::L1UC_L3WB (perf hint only)     |
+  ```
+- For non-system atomics:
+  - `atomicAdd(ptr, val)` → `sycl::atomic_ref<T, relaxed, device, global_space>(*ptr).fetch_add(val)`
+  - `atomicCAS(ptr, cmp, val)` → `sycl::atomic_ref<T, acq_rel, device, global_space>(*ptr).compare_exchange_strong(cmp, val)`
+- For system-scope atomics (IPC memory only):
+  - `atomicAdd_system(ptr, val)` → `atomic_fence(seq_cst, system); __atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST); atomic_fence(seq_cst, system);`
+
+### 4. Sub-Group (Warp) Size = 32
+- Use `[[sycl::reqd_sub_group_size(32)]]` on all kernel functors
+- Do NOT use sub_group size 16
+- All warp-level patterns (shfl, ballot, reduce) assume 32-wide sub_groups
+
+### 5. Intranode IPC Setup — Must Implement
+- NVLink P2P buffer access → Level Zero IPC handles over PCIe
+- The IPC infrastructure (buffer_ptrs[], barrier_signal_ptrs[]) must be set up:
+  - Use `zeMemGetIpcHandle` / `zeMemOpenIpcHandle` for cross-GPU memory mapping
+  - Setup code goes in `csrc_sycl/runtime.cpp`
+- `barrier_block` uses `atomicAdd_system`/`atomicSub_system` on IPC-mapped memory
+  - This must work over PCIe — use `atomic_fence(seq_cst, system)` bracketing
+
+### 6. Named Barriers (nbarrier) — tvisa
+- CUDA `barrier.sync N, count` → tvisa named barriers
+- Use tvisa's `named_barrier_init<N>()`, `nbarrier_signal(id, n_threads)`, `nbarrier_wait(id)`
+- Available in `tvisa/include/gateway.hpp`
+- `BarrierPayload` supports ProducerConsumer, ProducerOnly, ConsumerOnly modes
+- Pattern for replacing CUDA named barrier:
+  ```cpp
+  // CUDA: asm volatile("barrier.sync 0, %0;" ::"r"(count * 32));
+  // SYCL+tvisa:
+  named_barrier_init<N>();  // N = number of named barriers needed
+  nbarrier_signal(barrier_id, n_sub_groups_participating);
+  nbarrier_wait(barrier_id);
+  ```
+
+### 7. tvisa Header Dependencies
+- Include tvisa headers: `#include "gen_visa_templates.hpp"` (includes gateway.hpp, lsc.hpp)
+- tvisa source is at: https://github.com/CaoZhongZ/tvisa
+- tvisa is used for:
+  - **Named barriers**: `gateway.hpp` — nbarrier_signal, nbarrier_wait, named_barrier_init
+  - **Cache-controlled loads/stores**: `lsc.hpp` — lscLoad, lscStore with CacheCtrl
+  - **Block load/store** (TMA replacement): `regmap.hpp` — AddressPayload, __Matrix
+- tvisa is NOT used for: memory fences (use `sycl::atomic_fence`), atomics (use `sycl::atomic_ref`)
+
 ## Kernel Map
 
 | Argument | Source file | Source kernel | Output file |
@@ -68,42 +162,79 @@ semantics differ (e.g., quiet vs. fence ordering), mark `// HIGH_RISK:` and conf
 
 For every `asm volatile(...)` block: load `asm-translation-guide` skill.
 
-Pattern for system-scope fence before NIC doorbell:
+**CRITICAL**: Use `sycl::atomic_fence` for fences, NOT tvisa lscFence.
+
+Pattern for system-scope fence:
 ```cpp
-// CUDA: asm volatile("fence.sc.sys;" ::: "memory");
+// CUDA: asm volatile("fence.acq_rel.sys;" ::: "memory");
 // SYCL replacement:
-sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
 // PORTED_FROM: <file>:<line>
-// HIGH_RISK: verify atomic_fence(system) flushes GPU L2 so NIC DMA sees data on BMG
 ```
 
-For NIC MMIO writes and other hardware-specific PTX: load `asm-translation-guide` skill
-and fetch https://github.com/CaoZhongZ/tvisa for Intel GPU equivalents.
+Pattern for device-scope atomic:
+```cpp
+// CUDA: atomicAdd(ptr, val)
+// SYCL replacement:
+sycl::atomic_ref<int, sycl::memory_order::relaxed,
+    sycl::memory_scope::device,
+    sycl::access::address_space::global_space> ref(*ptr);
+int old = ref.fetch_add(val);
+```
+
+Pattern for volatile loads (spin-wait polling):
+```cpp
+// CUDA: asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+// SYCL replacement:
+int ret = *(volatile int*)ptr;
+// PORTED_FROM: <file>:<line>
+```
+
+Pattern for non-allocating stores (cache bypass):
+```cpp
+// CUDA: asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" :: "l"(ptr), "r"(val));
+// SYCL+tvisa replacement: lscStore with L1UC cache control
+// Or: use volatile store as fallback
+*(volatile int*)ptr = val;
+// PORTED_FROM: <file>:<line>
+```
+
+Pattern for named barriers:
+```cpp
+// CUDA: asm volatile("barrier.sync 0, %0;" :: "r"(count * 32));
+// SYCL+tvisa:
+named_barrier_init<N>();
+nbarrier_signal(barrier_id, n_sub_groups);
+nbarrier_wait(barrier_id);
+// PORTED_FROM: <file>:<line>
+```
 
 ### Step 5 — Generate SYCL Kernel Code
 
 Write `csrc_sycl/<output_file>` with:
 - `// PORTED_FROM: <original_file>`
+- `// === IBGDA → ishmem API Mapping Table ===` at the top of each kernel file
 - Full SYCL kernel using `sycl::nd_item`, `sycl::sub_group`, `sycl::local_accessor`
+- `[[sycl::reqd_sub_group_size(32)]]` on all kernel functors
 - Every `// HIGH_RISK:` annotation inline
 - Every `// MEMORY_MODEL_FIX:` annotation where fence/ordering was changed
+- tvisa includes: `#include "gen_visa_templates.hpp"`
 
 Required code pattern for cross-node flag/data ordering (inline in kernel):
 ```cpp
 // Producer: data → fence → ishmem PUT → quiet → flag PUT
 data_buf[idx] = value;
-sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
-ishmem_float_put_nbi(remote_buf + idx, data_buf + idx, count, peer_pe);
+sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+ishmem_putmem_nbi(remote_buf + idx, data_buf + idx, count, peer_pe);
 ishmem_quiet();
-ishmem_int_put(remote_flag, &done, 1, peer_pe);
+ishmem_int_p(remote_flag, done_val, peer_pe);
 
 // Consumer: spin on flag → fence → read data
 int f = 0;
 while (f == 0) {
-    sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
     f = *(volatile int*)remote_flag;
 }
-sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
 // now safe to read remote_buf
 ```
 
