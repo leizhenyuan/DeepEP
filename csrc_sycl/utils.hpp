@@ -5,6 +5,10 @@
 #include "configs.hpp"
 #include "exception.hpp"
 
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+#include "lsc.hpp"
+#endif
+
 // ============================================================
 // UNROLLED_WARP_COPY — Sub-group cooperative copy macro
 // ============================================================
@@ -171,7 +175,8 @@ inline int atomic_add_release_sys_global(const int* ptr, int value) {
 
 // atom.add.release.gpu.global.s32 — device-scope fetch_add with release ordering
 inline int atomic_add_release_global(const int* ptr, int value) {
-    sycl::atomic_ref<int, sycl::memory_order::release, sycl::memory_scope::device,
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::device,
                      sycl::access::address_space::global_space> ref(*const_cast<int*>(ptr));
     return ref.fetch_add(value);
 }
@@ -197,13 +202,29 @@ inline float ld_volatile_global(const float* ptr) { return *(volatile const floa
 inline int64_t ld_volatile_global(const int64_t* ptr) { return *(volatile const int64_t*)ptr; }
 inline int64_t ld_volatile_global(const uint64_t* ptr) { return static_cast<int64_t>(*(volatile const uint64_t*)ptr); }
 
-// ld.global.nc.L1::no_allocate — non-allocating load (cache bypass)
-// PORTED_FROM: csrc/kernels/utils.cuh:194-247
-// On SYCL: plain load. TODO: use tvisa lscLoad with L1UC_L3C for performance.
 
 template <typename dtype_t>
 inline dtype_t ld_nc_global(const dtype_t* ptr) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+    // Use tvisa lscLoad with L1UC_L3C cache control for L1 bypass
+    if constexpr (sizeof(dtype_t) == 1 || sizeof(dtype_t) == 2 ||
+                  sizeof(dtype_t) == 4 || sizeof(dtype_t) == 8) {
+        // Scalar load: d8c32 / d16c32 / d32 / d64 with L1 uncached
+        dtype_t val;
+        lscLoad<32, CacheCtrl::L1UC_L3C>(val, const_cast<void*>(static_cast<const void*>(ptr)));
+        return val;
+    } else if constexpr (sizeof(dtype_t) == 16) {
+        // 128-bit load (e.g. int4): decompose into d64x2 with L1 uncached
+        int64_t tmp[2];
+        lscLoad<32, CacheCtrl::L1UC_L3C>(tmp, const_cast<void*>(static_cast<const void*>(ptr)));
+        return *reinterpret_cast<const dtype_t*>(tmp);
+    } else {
+        // Unsupported size: plain load fallback
+        return *ptr;
+    }
+#else
     return *ptr;
+#endif
 }
 
 // st.relaxed.gpu.global.L1::no_allocate — non-allocating store
@@ -464,17 +485,18 @@ inline bool atomicCAS_device(T* ptr, T& expected, T desired) {
 // PORTED_FROM: csrc/kernels/utils.cuh:540-554
 
 inline int atomic_cas_cta_acquire(int* addr, int x, int y) {
-    sycl::atomic_ref<int, sycl::memory_order::acquire, sycl::memory_scope::work_group,
+    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::work_group,
                      sycl::access::address_space::local_space> ref(*addr);
     int expected = x;
-    ref.compare_exchange_strong(expected, y);
+    ref.compare_exchange_strong(expected, y,
+                                sycl::memory_order::acquire, sycl::memory_order::relaxed);
     return expected;  // Returns old value (= x if CAS succeeded, actual value if failed)
 }
 
 inline int atomic_exch_cta_release(int* addr, int x) {
-    sycl::atomic_ref<int, sycl::memory_order::release, sycl::memory_scope::work_group,
+    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::work_group,
                      sycl::access::address_space::local_space> ref(*addr);
-    return ref.exchange(x);
+    return ref.exchange(x, sycl::memory_order::release);
 }
 
 inline void acquire_lock(int* mutex) {
@@ -631,6 +653,47 @@ inline out_dtype_t extract_required_scale_format(float value) {
         return value;
     }
 }
+
+//   NBarrier nb_sender, nb_forwarder;
+//   nb_sender.init(kNumSenderWarps + 1);     // all sub-groups call init
+//   nb_forwarder.init(NUM_MAX_NVL_PEERS + 1);
+//   ...
+//   if (is_sender) nb_sender.sync();         // only sender sub-groups
+//   if (is_forwarder) nb_forwarder.sync();   // only forwarder sub-groups
+
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+
+struct __namedBarrier;
+
+extern SYCL_EXTERNAL __namedBarrier __attribute__((opencl_local)) *
+named_barrier_init(int count);
+
+extern SYCL_EXTERNAL void work_group_named_barrier(
+    __namedBarrier __attribute__((opencl_local)) *, unsigned int);
+
+#endif // __SYCL_DEVICE_ONLY__ && __SPIR__
+
+constexpr unsigned int CLK_LOCAL_MEM_FENCE  = 0x1;
+constexpr unsigned int CLK_GLOBAL_MEM_FENCE = 0x2;
+
+class NBarrier {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+    __namedBarrier __attribute__((opencl_local)) * handle_ = nullptr;
+#endif
+
+public:
+    inline void init([[maybe_unused]] int count) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+        handle_ = named_barrier_init(count);
+#endif
+    }
+
+    inline void sync([[maybe_unused]] unsigned int flags = CLK_LOCAL_MEM_FENCE) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
+        work_group_named_barrier(handle_, flags);
+#endif
+    }
+};
 
 // ============================================================
 // __ffs equivalent (find first set bit, 1-indexed, 0 if none)

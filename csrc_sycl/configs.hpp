@@ -9,8 +9,23 @@
 // Configuration Constants
 // ============================================================
 
-#define NUM_MAX_NVL_PEERS 8
+#define NUM_MAX_NVL_PEERS 2
 #define NUM_MAX_RDMA_PEERS 20
+
+// Type that can hold NUM_MAX_NVL_PEERS bools packed as bytes.
+// Must satisfy: sizeof(nvl_rank_mask_t) == NUM_MAX_NVL_PEERS * sizeof(bool).
+// Used to load is_token_in_rank[nvl_rank_0..nvl_rank_N] in one shot.
+#if NUM_MAX_NVL_PEERS == 8
+using nvl_rank_mask_t = uint64_t;
+#elif NUM_MAX_NVL_PEERS == 4
+using nvl_rank_mask_t = uint32_t;
+#elif NUM_MAX_NVL_PEERS == 2
+using nvl_rank_mask_t = uint16_t;
+#elif NUM_MAX_NVL_PEERS == 1
+using nvl_rank_mask_t = uint8_t;
+#else
+#error "Unsupported NUM_MAX_NVL_PEERS value"
+#endif
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
 #define NUM_BUFFER_ALIGNMENT_BYTES 128
@@ -42,6 +57,11 @@ struct int2 {
 
 struct int4 {
     int x, y, z, w;
+    // Volatile assignment needed for st_na_relaxed(volatile int4* ptr, int4 val)
+    volatile int4& operator=(const int4& rhs) volatile {
+        x = rhs.x; y = rhs.y; z = rhs.z; w = rhs.w;
+        return *this;
+    }
 };
 
 // ============================================================

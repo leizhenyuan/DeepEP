@@ -67,6 +67,14 @@ if(LevelZero_FOUND)
 endif()
 
 # =============================================================
+# PyTorch and pybind11 Configuration (for glue layer)
+# =============================================================
+
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Torch REQUIRED)
+find_package(pybind11 REQUIRED)
+
+# =============================================================
 # Source Files
 # =============================================================
 
@@ -75,37 +83,65 @@ set(SYCL_INFRA_HEADERS
     exception.hpp
     utils.hpp
     buffer.hpp
+    event.hpp
+    ipc.hpp
+    runtime.hpp
 )
 
-set(SYCL_KERNEL_SOURCES
-    internode_dispatch.cpp
-    # internode_combine.cpp      # TODO: Phase 3b
-    # internode_ll_dispatch.cpp  # TODO: Phase 3c
-    # internode_ll_combine.cpp   # TODO: Phase 3d
-    # runtime.cpp                # TODO: ishmem init/finalize
+set(SYCL_LEGACY_HEADERS
+    legacy/config.hpp
+    legacy/buffer.hpp
+)
+
+set(SYCL_SOURCES
+    python_api.cpp
+    # internode_dispatch.cpp  # Header-only, included via buffer.hpp
 )
 
 # =============================================================
-# Library Target
+# Python Extension Target (pybind11 module)
 # =============================================================
 
-add_library(deep_ep_sycl SHARED ${SYCL_KERNEL_SOURCES})
+pybind11_add_module(_C_sycl ${SYCL_SOURCES})
+
+target_include_directories(_C_sycl PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${TORCH_INCLUDE_DIRS}
+)
+
+target_link_libraries(_C_sycl PRIVATE ${TORCH_LIBRARIES})
+
+if(NOT DISABLE_ISHMEM AND ISHMEM_DIR)
+    target_link_libraries(_C_sycl PRIVATE ishmem)
+endif()
+
+# Level Zero for IPC handles
+target_link_libraries(_C_sycl PRIVATE ze_loader)
+
+# =============================================================
+# Library Target (for non-Python usage / testing)
+# =============================================================
+
+add_library(deep_ep_sycl SHARED ${SYCL_SOURCES})
 
 target_include_directories(deep_ep_sycl PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${TORCH_INCLUDE_DIRS}
 )
+
+target_link_libraries(deep_ep_sycl PUBLIC ${TORCH_LIBRARIES})
 
 if(NOT DISABLE_ISHMEM AND ISHMEM_DIR)
     target_link_libraries(deep_ep_sycl PUBLIC ishmem)
 endif()
 
-if(LevelZero_FOUND)
-    target_link_libraries(deep_ep_sycl PUBLIC ${LevelZero_LIBRARIES})
-endif()
+target_link_libraries(deep_ep_sycl PUBLIC ze_loader)
 
 # =============================================================
 # Install
 # =============================================================
 
 install(TARGETS deep_ep_sycl LIBRARY DESTINATION lib)
+install(TARGETS _C_sycl LIBRARY DESTINATION lib/python)
 install(FILES ${SYCL_INFRA_HEADERS} DESTINATION include/deep_ep_sycl)
+install(FILES ${SYCL_LEGACY_HEADERS} DESTINATION include/deep_ep_sycl/legacy)

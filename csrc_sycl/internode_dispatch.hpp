@@ -40,14 +40,6 @@
 #include <ishmemx.h>
 #endif
 
-// tvisa named barrier support (gateway.hpp from https://github.com/CaoZhongZ/tvisa)
-// Provides: named_barrier_init<N>(), nbarrier_signal(id, n_sub_groups), nbarrier_wait(id)
-// Required because CUDA barrier.sync N synchronizes a SUBSET of threads in a CTA,
-// and sycl::group_barrier() synchronizes ALL threads (would deadlock if any warp returns early).
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-#include "gateway.hpp"
-#endif
-
 #include <sycl/sycl.hpp>
 #include <cstdint>
 #include <limits>
@@ -64,7 +56,7 @@ namespace internode {
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
-    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "Invalid number of maximum NVL peers");
+    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 8 && NUM_MAX_NVL_PEERS >= 1, "Invalid number of maximum NVL peers");
 
     SourceMeta() = default;
 
@@ -185,7 +177,8 @@ struct NotifyDispatchKernel {
     int** barrier_signal_ptrs;
     int rank;
 
-    void operator()(sycl::nd_item<1> item) const [[sycl::reqd_sub_group_size(32)]] {
+    [[sycl::reqd_sub_group_size(32)]]
+    void operator()(sycl::nd_item<1> item) const {
         auto sg = item.get_sub_group();
         auto sm_id = static_cast<int>(item.get_group(0));
         auto thread_id = static_cast<int>(item.get_local_id(0));
@@ -392,9 +385,9 @@ struct NotifyDispatchKernel {
                 int total_count = 0;
                 int per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
                 for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
-                    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t),
+                    EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(nvl_rank_mask_t),
                                      "Invalid number of NVL peers");
-                    auto is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(
+                    auto is_token_in_rank_uint64 = *reinterpret_cast<const nvl_rank_mask_t*>(
                         is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
                     auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
                     #pragma unroll
@@ -521,7 +514,8 @@ struct DispatchKernel {
     static constexpr int kFwdRetiredOffset = kFwdHeadOffset + NUM_MAX_NVL_PEERS * kNumRDMARanks;
     static constexpr int kSlmSize = kFwdRetiredOffset + NUM_MAX_NVL_PEERS;
 
-    void operator()(sycl::nd_item<1> item) const [[sycl::reqd_sub_group_size(32)]] {
+    [[sycl::reqd_sub_group_size(32)]]
+    void operator()(sycl::nd_item<1> item) const {
         enum class WarpRole { kRDMASender, kRDMASenderCoordinator,
                               kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
@@ -615,13 +609,14 @@ struct DispatchKernel {
             .advance_also(rs_wr_buffer_ptr);
 
         // SLM pointers (shared memory emulation)
-        int* rdma_send_channel_lock_ptr = slm.get_pointer() + kLockOffset;
-        int* rdma_send_channel_tail_ptr = slm.get_pointer() + kTailOffset;
+        int* slm_raw = slm.get_multi_ptr<sycl::access::decorated::no>().get_raw();
+        int* rdma_send_channel_lock_ptr = slm_raw + kLockOffset;
+        int* rdma_send_channel_tail_ptr = slm_raw + kTailOffset;
         // We store uint32_t window in int slots — reinterpret
         uint32_t* rdma_send_channel_window_ptr =
-            reinterpret_cast<uint32_t*>(slm.get_pointer() + kWindowOffset);
-        int* forward_channel_head_ptr = slm.get_pointer() + kFwdHeadOffset;
-        int* forward_channel_retired_ptr = slm.get_pointer() + kFwdRetiredOffset;
+            reinterpret_cast<uint32_t*>(slm_raw + kWindowOffset);
+        int* forward_channel_head_ptr = slm_raw + kFwdHeadOffset;
+        int* forward_channel_retired_ptr = slm_raw + kFwdRetiredOffset;
 
         // Helper to access forward_channel_head[nvl][rdma]
         auto fwd_head = [&](int nvl, int rdma) -> volatile int& {
@@ -631,40 +626,15 @@ struct DispatchKernel {
             return *reinterpret_cast<volatile int*>(forward_channel_retired_ptr + nvl);
         };
 
-        // ============================================================
-        // Named barrier via tvisa (gateway.hpp)
-        // ============================================================
-        // PORTED_FROM: csrc/kernels/internode.cu:563,580
-        // CUDA: barrier.sync 0, (kNumDispatchRDMASenderWarps + 1) * 32
-        //       barrier.sync 1, (NUM_MAX_NVL_PEERS + 1) * 32
-        // These synchronize a SUBSET of warps within a CTA.
-        // sycl::group_barrier() would DEADLOCK here because some warps return early
-        // (e.g., kForwarderCoordinator warps with target_rank > 0).
-        //
-        // tvisa nbarrier_signal(id, n_sub_groups) + nbarrier_wait(id) provides
-        // the exact same subset synchronization as CUDA named barriers.
-        // Barrier 0: sender warps (kNumDispatchRDMASenderWarps) + coordinator (1)
-        // Barrier 1: forwarder warps (NUM_MAX_NVL_PEERS) + coordinator (1)
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-        // Initialize 2 named barriers at kernel entry (once per work-group, idempotent per sub_group)
-        named_barrier_init<2>();
-#endif
+        NBarrier nb_sender, nb_forwarder;
+        nb_sender.init(kNumDispatchRDMASenderWarps + 1);
+        nb_forwarder.init(NUM_MAX_NVL_PEERS + 1);
+
         auto sync_rdma_sender_smem = [&]() {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-            nbarrier_signal(0, static_cast<uint8_t>(kNumDispatchRDMASenderWarps + 1));
-            nbarrier_wait(0);
-#else
-            // Host fallback (not used in real execution)
-            sycl::group_barrier(item.get_group());
-#endif
+            nb_sender.sync();
         };
         auto sync_forwarder_smem = [&]() {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__SPIR__)
-            nbarrier_signal(1, static_cast<uint8_t>(NUM_MAX_NVL_PEERS + 1));
-            nbarrier_wait(1);
-#else
-            sycl::group_barrier(item.get_group());
-#endif
+            nb_forwarder.sync();
         };
 
         // ===========================
@@ -684,6 +654,8 @@ struct DispatchKernel {
                     ? rdma_channel_meta.recv_buffer(dst_rdma_rank)
                     : rdma_channel_meta.send_buffer(dst_rdma_rank);
 
+                // 写入metadata，格式为负数的prefix sum（-value-1）
+                // 主要包括当前cheannel的起始和结束位置，以及每个NVL rank的prefix sum
                 if (lane_id < NUM_MAX_NVL_PEERS) {
                     dst_ptr[lane_id] = -(channel_id == 0 ? 0
                         : gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) *
@@ -708,6 +680,7 @@ struct DispatchKernel {
                     auto dst_meta = rdma_channel_meta.recv_buffer(rdma_rank);
                     auto src_meta = rdma_channel_meta.send_buffer(dst_rdma_rank);
                     auto dst_pe = translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank);
+                    // nvshmemi_ibgda_put_nbi_warp 需要确认和 ishmemx_putmem_nbi_work_group 是等价的
                     ishmemx_putmem_nbi_work_group(
                         dst_meta, src_meta,
                         sizeof(int) * (NUM_MAX_NVL_PEERS * 2 + 2),
@@ -726,9 +699,9 @@ struct DispatchKernel {
 
             for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
                 // Read RDMA rank existence
-                uint64_t is_token_in_rank_uint64 = 0;
+                nvl_rank_mask_t is_token_in_rank_uint64 = 0;
                 if (lane_id < kNumRDMARanks) {
-                    is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(
+                    is_token_in_rank_uint64 = *reinterpret_cast<const nvl_rank_mask_t*>(
                         is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS);
                     global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
                 }
@@ -768,7 +741,8 @@ struct DispatchKernel {
                     int slot_idx = sycl::select_from_group(sg, rdma_tail_idx, i);
                     if (slot_idx >= 0) {
                         slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
-                        auto recv_is_token_in_rank_uint64 = broadcast(sg, is_token_in_rank_uint64, i);
+                        // broadcast nvl_rank_mask_t: fits in a single shuffle for all supported sizes
+                        auto recv_is_token_in_rank_uint64 = sycl::select_from_group(sg, is_token_in_rank_uint64, i);
                         auto recv_is_token_in_rank_values =
                             reinterpret_cast<const bool*>(&recv_is_token_in_rank_uint64);
                         if (lane_id == num_topk_ranks)
@@ -975,7 +949,7 @@ struct DispatchKernel {
             }
             syncwarp(sg);
 
-            send_nvl_head += src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank;
+            int* local_send_nvl_head = send_nvl_head + src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank;
             sync_forwarder_smem();
 
             // Forward tokens from RDMA → NVL buffer
@@ -1027,7 +1001,7 @@ struct DispatchKernel {
                         auto cached_h = is_in_dst ? rdma_nvl_token_idx : -1;
                         rdma_nvl_token_idx += is_in_dst;
                         if (!kCachedMode)
-                            send_nvl_head[ii * NUM_MAX_NVL_PEERS] = cached_h;
+                            local_send_nvl_head[ii * NUM_MAX_NVL_PEERS] = cached_h;
                     }
                     if (!is_in_dst)
                         continue;
